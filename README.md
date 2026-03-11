@@ -3,38 +3,50 @@
 The following steps reproduce a clean setup from scratch.
 
 ### 1. Clone the repository
+
 ```bash
 git clone https://github.com/PaavanBagla/SAM3_ROS_NODE.git
 ```
+
 ### 2. Place it in a ROS2 workspace
+
 ```bash
 mkdir -p test_sam3_ws/src
 mv SAM3_ROS_NODE test_sam3_ws/src/
 cd test_sam3_ws
 ```
+
 ### 3. Build the workspace
+
 ```bash
 colcon build
 ```
+
 ### 4. Source the workspace and run the node
+
 ```bash
 source install/setup.bash
 ros2 run sam3_ros segmentation_node
 ```
+
 If the setup is correct, the node should start and publish segmentation topics.
 
 ### 5. Verify topics
 
 In another terminal run:
+
 ```bash
 ros2 topic list
 ```
+
 You should see topics similar to:
+
 ```bash
-/segmentation/detections  
-/segmentation/mask_image/compressed  
+/segmentation/detections
+/segmentation/mask_image/compressed
 /segmentation/result_image/compressed
 ```
+
 If these topics appear, the node is running correctly and the segmentation pipeline is active.
 
 ---
