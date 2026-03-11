@@ -35,6 +35,7 @@ class Segmentation(rclpy.node.Node):
 
     def __init__(self) -> None:
         super().__init__("segmentation")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         use_compressed_image = (
             self.declare_parameter("use_compressed_image", True).get_parameter_value().bool_value
@@ -52,6 +53,8 @@ class Segmentation(rclpy.node.Node):
         )
 
         self.model = sam3.build_sam3_image_model()
+        self.model.to(self.device)
+
         self.processor = sam3.model.sam3_image_processor.Sam3Processor(
             self.model, confidence_threshold=confidence_threshold
         )
@@ -69,7 +72,7 @@ class Segmentation(rclpy.node.Node):
                 [0, 255, 255],
             ],
             dtype=torch.uint8,
-        ).cuda()
+        ).to(self.device)
 
         self.cv_bridge = cv_bridge.CvBridge()
 
@@ -116,7 +119,7 @@ class Segmentation(rclpy.node.Node):
     def _run_inference(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
         start = time.time_ns()
         inference_state = self.processor.set_image(
-            torch.from_numpy(image.transpose(2, 0, 1)).cuda()
+            torch.from_numpy(image.transpose(2, 0, 1)).to(self.device)
         )
         output = self.processor.set_text_prompt(self.text_prompt, inference_state)
         self.get_logger().debug(f"Inference time: {(time.time_ns() - start) / 1e6:.3f} ms")
@@ -133,7 +136,7 @@ class Segmentation(rclpy.node.Node):
         mask_image = (
             (
                 self.result.masks
-                * torch.arange(1, self.result.masks.shape[0] + 1).cuda().view(-1, 1, 1, 1)
+                * torch.arange(1, self.result.masks.shape[0] + 1).to(self.device).view(-1, 1, 1, 1)
             )
             .to(torch.uint64)
             .sum(dim=0)

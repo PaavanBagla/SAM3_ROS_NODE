@@ -1,3 +1,6 @@
-.vscode/
-
+build/
+install/
+log/
+.venv/
 __pycache__/
+*.pyc
