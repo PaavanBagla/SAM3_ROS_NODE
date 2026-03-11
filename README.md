@@ -37,7 +37,8 @@ You should see topics similar to:
 
 If these topics appear, the node is running correctly and the segmentation pipeline is active.
 
------
+---
+
 # sam3_ros
 
 🤖 ROS 2 wrapper for [SAM 3](https://github.com/facebookresearch/sam3)
