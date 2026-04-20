@@ -2,16 +2,16 @@ cmake_minimum_required(VERSION 3.8)
 project(sam3_ros)
 
 find_package(ament_cmake_auto REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 
 ament_auto_find_build_dependencies()
 
-add_custom_target(${PROJECT_NAME}_venv ALL
-  COMMAND UV_PROJECT_ENVIRONMENT=${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/.venv uv sync
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
+ament_python_install_package(${PROJECT_NAME} PACKAGE_DIR src/${PROJECT_NAME})
 
 install(
-  PROGRAMS ${CMAKE_INSTALL_PREFIX}/share/${PROJECT_NAME}/.venv/bin/segmentation_node
+  PROGRAMS
+    scripts/segmentation_node
+    src/sam3_ros/pub_test_image.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
