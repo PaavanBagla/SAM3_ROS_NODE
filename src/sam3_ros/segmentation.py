@@ -40,12 +40,12 @@ class Segmentation(rclpy.node.Node):
         self.model_dtype = torch.float32
 
         use_compressed_image = (
-            self.declare_parameter("use_compressed_image", True)
+            self.declare_parameter("use_compressed_image", False)
             .get_parameter_value()
             .bool_value
         )
         self.text_prompt = (
-            self.declare_parameter("text_prompt", "")
+            self.declare_parameter("text_prompt", "road")
             .get_parameter_value()
             .string_value
         )
@@ -128,7 +128,7 @@ class Segmentation(rclpy.node.Node):
         else:
             self.image_sub = self.create_subscription(
                 sensor_msgs.msg.Image,
-                "image",
+                "/camera_fl/image_color",
                 self._image_callback,
                 rclpy.qos.qos_profile_sensor_data,
             )

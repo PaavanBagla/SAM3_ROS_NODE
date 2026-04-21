@@ -11,7 +11,6 @@ ament_python_install_package(${PROJECT_NAME} PACKAGE_DIR src/${PROJECT_NAME})
 install(
   PROGRAMS
     scripts/segmentation_node
-    src/sam3_ros/pub_test_image.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
