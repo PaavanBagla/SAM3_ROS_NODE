@@ -1,6 +1,7 @@
 import threading
 import time
 import traceback
+import re
 
 import cv2
 import cv_bridge
@@ -37,6 +38,13 @@ class Segmentation(rclpy.node.Node):
     def __init__(self) -> None:
         super().__init__("segmentation")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_amp = (
+            self.declare_parameter("use_amp", True)
+            .get_parameter_value()
+            .bool_value
+        )
+        self.amp_enabled = bool(use_amp and self.device.type == "cuda")
+        # Keep model weights in fp32 for compatibility; autocast handles mixed precision.
         self.model_dtype = torch.float32
 
         use_compressed_image = (
@@ -45,7 +53,7 @@ class Segmentation(rclpy.node.Node):
             .bool_value
         )
         self.text_prompt = (
-            self.declare_parameter("text_prompt", "road")
+            self.declare_parameter("text_prompt", "asphalt, tarmac, road")
             .get_parameter_value()
             .string_value
         )
@@ -65,7 +73,8 @@ class Segmentation(rclpy.node.Node):
             f"use_compressed_image={use_compressed_image}, "
             f"text_prompt='{self.text_prompt}', "
             f"confidence_threshold={confidence_threshold}, "
-            f"result_visualization_rate={result_visualization_rate}"
+            f"result_visualization_rate={result_visualization_rate}, "
+            f"use_amp={self.amp_enabled}"
         )
 
         if self.text_prompt == "":
@@ -113,6 +122,7 @@ class Segmentation(rclpy.node.Node):
         self.mask_image_pub = self.create_publisher(
             sensor_msgs.msg.CompressedImage, "~/mask_image/compressed", 1
         )
+        self.result_image_pub = self.create_publisher(sensor_msgs.msg.Image, "~/result_image", 1)
         self.detections_pub = self.create_publisher(
             vision_msgs.msg.Detection2DArray, "~/detections", 1
         )
@@ -135,7 +145,7 @@ class Segmentation(rclpy.node.Node):
             self.get_logger().info("Subscribed to topic: image")
 
         if result_visualization_rate > 0.0:
-            self.result_image_pub = self.create_publisher(
+            self.result_image_compressed_pub = self.create_publisher(
                 sensor_msgs.msg.CompressedImage, "~/result_image/compressed", 1
             )
             self.visualize_result_timer = self.create_timer(
@@ -237,10 +247,143 @@ class Segmentation(rclpy.node.Node):
 
         return masks > 0.5
 
+    def _empty_outputs(
+        self, image_shape: tuple[int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h, w = image_shape
+        masks = torch.zeros((0, h, w), dtype=torch.bool, device=self.device)
+        boxes = torch.zeros((0, 4), dtype=torch.float32, device=self.device)
+        scores = torch.zeros((0,), dtype=torch.float32, device=self.device)
+        return masks, boxes, scores
+
+    def _run_prompt_query(
+        self,
+        prompt: str,
+        inference_state,
+        image_shape: tuple[int, int],
+        inference_id: int,
+        label: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        t_start = time.time()
+        with torch.inference_mode():
+            if self.device.type == "cuda":
+                with torch.autocast("cuda", enabled=self.amp_enabled, dtype=torch.float16):
+                    output = self.processor.set_text_prompt(prompt, inference_state)
+            else:
+                output = self.processor.set_text_prompt(prompt, inference_state)
+
+        masks = self._normalize_masks(output["masks"], image_shape)
+        boxes = torch.as_tensor(output["boxes"], device=self.device, dtype=torch.float32)
+        scores = torch.as_tensor(output["scores"], device=self.device, dtype=torch.float32)
+
+        if boxes.numel() == 0:
+            boxes = boxes.reshape(0, 4)
+        if scores.numel() == 0:
+            scores = scores.reshape(0)
+
+        suffix = f" [{label}]" if label else ""
+        self.get_logger().info(
+            f"[Inference {inference_id}] set_text_prompt('{prompt}'){suffix} done in {time.time() - t_start:.3f}s"
+        )
+
+        return masks, boxes, scores
+
+    def _run_prompt_expression(
+        self,
+        inference_state,
+        image_shape: tuple[int, int],
+        inference_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        expression = self.text_prompt.strip()
+        lower = expression.lower()
+
+        has_or = bool(re.search(r"\s(?:or|\|)\s", lower))
+        has_and = bool(re.search(r"\s(?:and|&)\s", lower))
+
+        if has_or and has_and:
+            self.get_logger().warn(
+                f"[Inference {inference_id}] Mixed AND/OR expressions are not supported yet; using literal prompt."
+            )
+            return self._run_prompt_query(expression, inference_state, image_shape, inference_id)
+
+        if has_or:
+            terms = [t.strip() for t in re.split(r"\s*(?:\bor\b|\|)\s*", expression) if t.strip()]
+            if not terms:
+                return self._empty_outputs(image_shape)
+
+            all_masks: list[torch.Tensor] = []
+            all_boxes: list[torch.Tensor] = []
+            all_scores: list[torch.Tensor] = []
+
+            for term in terms:
+                masks, boxes, scores = self._run_prompt_query(
+                    term, inference_state, image_shape, inference_id, label="OR"
+                )
+                if masks.shape[0] > 0:
+                    all_masks.append(masks)
+                if boxes.shape[0] > 0:
+                    all_boxes.append(boxes)
+                if scores.shape[0] > 0:
+                    all_scores.append(scores)
+
+            if not all_masks:
+                return self._empty_outputs(image_shape)
+
+            return (
+                torch.cat(all_masks, dim=0),
+                torch.cat(all_boxes, dim=0),
+                torch.cat(all_scores, dim=0),
+            )
+
+        if has_and:
+            terms = [t.strip() for t in re.split(r"\s*(?:\band\b|&)\s*", expression) if t.strip()]
+            if not terms:
+                return self._empty_outputs(image_shape)
+
+            term_unions: list[torch.Tensor] = []
+            term_best_scores: list[float] = []
+
+            for term in terms:
+                masks, _, scores = self._run_prompt_query(
+                    term, inference_state, image_shape, inference_id, label="AND"
+                )
+                if masks.shape[0] == 0:
+                    return self._empty_outputs(image_shape)
+                term_unions.append(masks.any(dim=0))
+                term_best_scores.append(float(scores.max().item()) if scores.numel() > 0 else 0.0)
+
+            combined_mask = term_unions[0]
+            for term_mask in term_unions[1:]:
+                combined_mask = torch.logical_and(combined_mask, term_mask)
+
+            if not torch.any(combined_mask):
+                return self._empty_outputs(image_shape)
+
+            ys, xs = torch.where(combined_mask)
+            x1 = float(xs.min().item())
+            y1 = float(ys.min().item())
+            x2 = float(xs.max().item() + 1)
+            y2 = float(ys.max().item() + 1)
+
+            masks = combined_mask.unsqueeze(0)
+            boxes = torch.tensor([[x1, y1, x2, y2]], dtype=torch.float32, device=self.device)
+            score = min(term_best_scores) if term_best_scores else 0.0
+            scores = torch.tensor([score], dtype=torch.float32, device=self.device)
+            return masks, boxes, scores
+
+        return self._run_prompt_query(expression, inference_state, image_shape, inference_id)
+
     def _run_inference(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
         self.inference_count += 1
         inference_id = self.inference_count
         total_start = time.time()
+
+        current_prompt = self.get_parameter("text_prompt").get_parameter_value().string_value
+        if current_prompt != self.text_prompt:
+            self.text_prompt = current_prompt
+            self.get_logger().info(
+                f"[Inference {inference_id}] text_prompt updated to '{self.text_prompt}'"
+            )
 
         self.get_logger().info(f"[Inference {inference_id}] Starting inference")
 
@@ -255,7 +398,7 @@ class Segmentation(rclpy.node.Node):
             t1 = time.time()
             with torch.inference_mode():
                 if self.device.type == "cuda":
-                    with torch.autocast("cuda", enabled=False):
+                    with torch.autocast("cuda", enabled=self.amp_enabled, dtype=torch.float16):
                         inference_state = self.processor.set_image(image_tensor)
                 else:
                     inference_state = self.processor.set_image(image_tensor)
@@ -263,25 +406,11 @@ class Segmentation(rclpy.node.Node):
                 f"[Inference {inference_id}] set_image() done in {time.time() - t1:.3f}s"
             )
 
-            t2 = time.time()
-            with torch.inference_mode():
-                if self.device.type == "cuda":
-                    with torch.autocast("cuda", enabled=False):
-                        output = self.processor.set_text_prompt(self.text_prompt, inference_state)
-                else:
-                    output = self.processor.set_text_prompt(self.text_prompt, inference_state)
-            self.get_logger().info(
-                f"[Inference {inference_id}] set_text_prompt() done in {time.time() - t2:.3f}s"
+            masks, boxes, scores = self._run_prompt_expression(
+                inference_state=inference_state,
+                image_shape=image.shape[:2],
+                inference_id=inference_id,
             )
-
-            masks = self._normalize_masks(output["masks"], image.shape[:2])
-            boxes = torch.as_tensor(output["boxes"], device=self.device, dtype=torch.float32)
-            scores = torch.as_tensor(output["scores"], device=self.device, dtype=torch.float32)
-
-            if boxes.numel() == 0:
-                boxes = boxes.reshape(0, 4)
-            if scores.numel() == 0:
-                scores = scores.reshape(0)
 
             self.get_logger().info(
                 f"[Inference {inference_id}] Output: "
@@ -290,26 +419,29 @@ class Segmentation(rclpy.node.Node):
                 f"scores_shape={tuple(scores.shape)}"
             )
 
+            result_for_publish = Segmentation.Result(
+                header=header,
+                image=image.copy(),
+                masks=masks.detach().clone(),
+                boxes=boxes.detach().clone(),
+                scores=scores.detach().clone(),
+            )
+
             with self.result_lock:
-                self.result = Segmentation.Result(
-                    header=header,
-                    image=image.copy(),
-                    masks=masks.detach().clone(),
-                    boxes=boxes.detach().clone(),
-                    scores=scores.detach().clone(),
-                )
+                self.result = result_for_publish
 
             if masks.shape[0] == 0:
                 self.get_logger().warn(f"[Inference {inference_id}] No masks detected.")
 
             if masks.shape[0] > 0:
+                # Use int32 on CUDA to avoid unsupported uint16 arange kernels.
                 mask_ids = (
-                    masks.to(torch.uint16)
+                    masks.to(torch.int32)
                     * torch.arange(
                         1,
                         masks.shape[0] + 1,
                         device=self.device,
-                        dtype=torch.uint16,
+                        dtype=torch.int32,
                     ).view(-1, 1, 1)
                 ).amax(dim=0)
             else:
@@ -320,6 +452,83 @@ class Segmentation(rclpy.node.Node):
             mask_image_msg.header = header
             self.mask_image_pub.publish(mask_image_msg)
             self.get_logger().info(f"[Inference {inference_id}] Published mask_image/compressed")
+
+            # Publish a raw overlaid frame every inference for RViz image display.
+            result_image = result_for_publish.image.copy()
+            if result_for_publish.masks.numel() > 0 and result_for_publish.masks.shape[0] > 0:
+                colored_masks = (
+                    result_for_publish.masks.to(torch.uint8).unsqueeze(1)
+                    * self.colors[
+                        torch.arange(
+                            result_for_publish.masks.shape[0], device=self.device
+                        )
+                        % self.colors.shape[0]
+                    ].view(-1, 3, 1, 1)
+                ).amax(dim=0).to(torch.uint8)
+
+                overlay = colored_masks.permute(1, 2, 0).cpu().numpy()
+                result_image = cv2.addWeighted(
+                    result_image,
+                    1.0,
+                    overlay,
+                    0.5,
+                    0.0,
+                )
+
+                box_thickness = 3
+                font_scale = 1.2
+                text_color = (255, 255, 255)
+                text_thickness = 2
+
+                for i, (box, score) in enumerate(zip(result_for_publish.boxes, result_for_publish.scores)):
+                    x1, y1, x2, y2 = box.to(torch.int32).tolist()
+                    box_color = tuple(
+                        int(v) for v in self.colors[i % self.colors.shape[0]].cpu().tolist()
+                    )
+                    text = (
+                        f"{self.text_prompt}:{score.item():.2f}"
+                        if self.text_prompt
+                        else f"{score.item():.2f}"
+                    )
+
+                    (text_width, text_height), _ = cv2.getTextSize(
+                        text,
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=font_scale,
+                        thickness=text_thickness,
+                    )
+
+                    text_y1 = y1 - text_height - 8 if y1 - text_height - 8 > 0 else y1
+                    text_y2 = y1 if y1 - text_height - 8 > 0 else y1 + text_height + 8
+
+                    cv2.rectangle(
+                        result_image,
+                        (x1, y1),
+                        (x2, y2),
+                        color=box_color,
+                        thickness=box_thickness,
+                    )
+                    cv2.rectangle(
+                        result_image,
+                        (x1, text_y1),
+                        (x1 + text_width + 8, text_y2),
+                        color=box_color,
+                        thickness=cv2.FILLED,
+                    )
+                    cv2.putText(
+                        result_image,
+                        text,
+                        (x1 + 4, text_y2 - 4),
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=font_scale,
+                        color=text_color,
+                        thickness=text_thickness,
+                    )
+
+            result_image_msg = self.cv_bridge.cv2_to_imgmsg(result_image, encoding="bgr8")
+            result_image_msg.header = header
+            self.result_image_pub.publish(result_image_msg)
+            self.get_logger().info(f"[Inference {inference_id}] Published result_image")
 
             detections = vision_msgs.msg.Detection2DArray()
             detections.header = header
@@ -383,7 +592,7 @@ class Segmentation(rclpy.node.Node):
             if result.masks.numel() == 0 or result.masks.shape[0] == 0:
                 result_image_msg = self.cv_bridge.cv2_to_compressed_imgmsg(result.image)
                 result_image_msg.header = result.header
-                self.result_image_pub.publish(result_image_msg)
+                self.result_image_compressed_pub.publish(result_image_msg)
                 return
 
             colored_masks = (
@@ -449,7 +658,7 @@ class Segmentation(rclpy.node.Node):
 
             result_image_msg = self.cv_bridge.cv2_to_compressed_imgmsg(result.image)
             result_image_msg.header = result.header
-            self.result_image_pub.publish(result_image_msg)
+            self.result_image_compressed_pub.publish(result_image_msg)
 
         except Exception as e:
             self.get_logger().error(f"Exception in _visualize_result: {type(e).__name__}: {e}")
