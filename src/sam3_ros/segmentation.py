@@ -1,3 +1,4 @@
+import queue
 import threading
 import time
 import traceback
@@ -17,6 +18,7 @@ import sensor_msgs.msg
 import std_msgs.msg
 import torch
 import vision_msgs.msg
+from sam2_msgs.msg import DetectedRoadArea
 
 
 class Segmentation(rclpy.node.Node):
@@ -67,6 +69,21 @@ class Segmentation(rclpy.node.Node):
             .get_parameter_value()
             .double_value
         )
+        self.input_max_size = int(
+            self.declare_parameter("input_max_size", 1024)
+            .get_parameter_value()
+            .integer_value
+        )
+        left_contour_topic = (
+            self.declare_parameter("left_contour_topic", "/sam3_left_contour")
+            .get_parameter_value()
+            .string_value
+        )
+        right_contour_topic = (
+            self.declare_parameter("right_contour_topic", "/sam3_right_contour")
+            .get_parameter_value()
+            .string_value
+        )
 
         self.get_logger().info(f"Segmentation node starting on device: {self.device}")
         self.get_logger().info(
@@ -103,6 +120,7 @@ class Segmentation(rclpy.node.Node):
         self.result: Segmentation.Result | None = None
         self.received_frame_count = 0
         self.inference_count = 0
+        self._zero_stamp_warned = False
 
         self.colors = torch.tensor(
             [
@@ -126,6 +144,11 @@ class Segmentation(rclpy.node.Node):
         self.detections_pub = self.create_publisher(
             vision_msgs.msg.Detection2DArray, "~/detections", 1
         )
+        self.left_contour_pub = self.create_publisher(DetectedRoadArea, left_contour_topic, 1)
+        self.right_contour_pub = self.create_publisher(DetectedRoadArea, right_contour_topic, 1)
+
+        # Cached prompt parse: avoid re-parsing regex every frame
+        self._cached_prompt_parse: dict = {}
 
         if use_compressed_image:
             self.image_sub = self.create_subscription(
@@ -159,6 +182,14 @@ class Segmentation(rclpy.node.Node):
 
         self.get_logger().info("Segmentation node ready. Waiting for images...")
 
+        # Async inference: callbacks drop frames into a maxsize=1 queue; worker thread
+        # pops and runs inference so the ROS executor is never blocked.
+        self._infer_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._infer_thread = threading.Thread(
+            target=self._inference_worker, daemon=True, name="sam3_infer"
+        )
+        self._infer_thread.start()
+
     def _normalize_input_image(self, image: numpy.ndarray) -> numpy.ndarray:
         if image is None:
             raise ValueError("Input image is None")
@@ -177,17 +208,13 @@ class Segmentation(rclpy.node.Node):
 
     def _image_compressed_callback(self, msg: sensor_msgs.msg.CompressedImage) -> None:
         self.received_frame_count += 1
-        self.get_logger().info(
-            f"Received compressed image #{self.received_frame_count}, format={msg.format}"
-        )
         try:
             image = self.cv_bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
             image = self._normalize_input_image(image)
-            self.get_logger().info(
-                f"Decoded compressed image #{self.received_frame_count}, "
-                f"shape={image.shape}, dtype={image.dtype}"
-            )
-            self._run_inference(image, msg.header)
+            try:
+                self._infer_queue.put_nowait((image, msg.header))
+            except queue.Full:
+                pass  # drop frame — inference still busy
         except Exception as e:
             self.get_logger().error(
                 f"Exception in _image_compressed_callback: {type(e).__name__}: {e}"
@@ -196,20 +223,40 @@ class Segmentation(rclpy.node.Node):
 
     def _image_callback(self, msg: sensor_msgs.msg.Image) -> None:
         self.received_frame_count += 1
-        self.get_logger().info(
-            f"Received raw image #{self.received_frame_count}, encoding={msg.encoding}"
-        )
         try:
             image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             image = self._normalize_input_image(image)
-            self.get_logger().info(
-                f"Decoded raw image #{self.received_frame_count}, "
-                f"shape={image.shape}, dtype={image.dtype}"
-            )
-            self._run_inference(image, msg.header)
+            try:
+                self._infer_queue.put_nowait((image, msg.header))
+            except queue.Full:
+                pass  # drop frame — inference still busy
         except Exception as e:
             self.get_logger().error(f"Exception in _image_callback: {type(e).__name__}: {e}")
             self.get_logger().error(traceback.format_exc())
+
+    def _inference_worker(self) -> None:
+        while True:
+            item = self._infer_queue.get()
+            if item is None:
+                break
+            image, header = item
+            self._run_inference(image, header)
+
+    def _sanitize_header(self, header: std_msgs.msg.Header) -> std_msgs.msg.Header:
+        sanitized = std_msgs.msg.Header()
+        sanitized.frame_id = header.frame_id
+
+        if header.stamp.sec == 0 and header.stamp.nanosec == 0:
+            sanitized.stamp = self.get_clock().now().to_msg()
+            if not self._zero_stamp_warned:
+                self.get_logger().warn(
+                    "Received image header with zero timestamp; using current ROS time for outputs."
+                )
+                self._zero_stamp_warned = True
+        else:
+            sanitized.stamp = header.stamp
+
+        return sanitized
 
     def _prepare_image_tensor(self, image: numpy.ndarray) -> torch.Tensor:
         image_chw = numpy.transpose(image, (2, 0, 1))
@@ -282,7 +329,7 @@ class Segmentation(rclpy.node.Node):
             scores = scores.reshape(0)
 
         suffix = f" [{label}]" if label else ""
-        self.get_logger().info(
+        self.get_logger().debug(
             f"[Inference {inference_id}] set_text_prompt('{prompt}'){suffix} done in {time.time() - t_start:.3f}s"
         )
 
@@ -297,8 +344,12 @@ class Segmentation(rclpy.node.Node):
         expression = self.text_prompt.strip()
         lower = expression.lower()
 
-        has_or = bool(re.search(r"\s(?:or|\|)\s", lower))
-        has_and = bool(re.search(r"\s(?:and|&)\s", lower))
+        # Cache parse result so regex runs only when prompt changes
+        if expression not in self._cached_prompt_parse:
+            has_or = bool(re.search(r"\s(?:or|\|)\s", lower))
+            has_and = bool(re.search(r"\s(?:and|&)\s", lower))
+            self._cached_prompt_parse = {expression: (has_or, has_and)}
+        has_or, has_and = self._cached_prompt_parse[expression]
 
         if has_or and has_and:
             self.get_logger().warn(
@@ -377,20 +428,31 @@ class Segmentation(rclpy.node.Node):
         self.inference_count += 1
         inference_id = self.inference_count
         total_start = time.time()
+        header = self._sanitize_header(header)
 
         current_prompt = self.get_parameter("text_prompt").get_parameter_value().string_value
         if current_prompt != self.text_prompt:
             self.text_prompt = current_prompt
+            self._cached_prompt_parse.clear()
             self.get_logger().info(
                 f"[Inference {inference_id}] text_prompt updated to '{self.text_prompt}'"
             )
 
-        self.get_logger().info(f"[Inference {inference_id}] Starting inference")
+        self.get_logger().debug(f"[Inference {inference_id}] Starting inference")
+
+        # Optionally downscale large images before inference to improve speed.
+        orig_h, orig_w = image.shape[:2]
+        if self.input_max_size > 0 and max(orig_h, orig_w) > self.input_max_size:
+            scale = self.input_max_size / max(orig_h, orig_w)
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            image = cv2.resize(image, (new_w, new_h))
+        infer_h, infer_w = image.shape[:2]
 
         try:
             t0 = time.time()
             image_tensor = self._prepare_image_tensor(image)
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[Inference {inference_id}] Image tensor ready in {time.time() - t0:.3f}s, "
                 f"shape={tuple(image_tensor.shape)}, device={image_tensor.device}, dtype={image_tensor.dtype}"
             )
@@ -402,7 +464,7 @@ class Segmentation(rclpy.node.Node):
                         inference_state = self.processor.set_image(image_tensor)
                 else:
                     inference_state = self.processor.set_image(image_tensor)
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[Inference {inference_id}] set_image() done in {time.time() - t1:.3f}s"
             )
 
@@ -412,7 +474,7 @@ class Segmentation(rclpy.node.Node):
                 inference_id=inference_id,
             )
 
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[Inference {inference_id}] Output: "
                 f"masks_shape={tuple(masks.shape)}, "
                 f"boxes_shape={tuple(boxes.shape)}, "
@@ -451,84 +513,22 @@ class Segmentation(rclpy.node.Node):
             mask_image_msg = self.cv_bridge.cv2_to_compressed_imgmsg(mask_image_np)
             mask_image_msg.header = header
             self.mask_image_pub.publish(mask_image_msg)
-            self.get_logger().info(f"[Inference {inference_id}] Published mask_image/compressed")
+            self.get_logger().debug(f"[Inference {inference_id}] Published mask_image/compressed")
 
-            # Publish a raw overlaid frame every inference for RViz image display.
-            result_image = result_for_publish.image.copy()
-            if result_for_publish.masks.numel() > 0 and result_for_publish.masks.shape[0] > 0:
+            annotated = image.copy()
+            if masks.shape[0] > 0:
                 colored_masks = (
-                    result_for_publish.masks.to(torch.uint8).unsqueeze(1)
+                    masks.to(torch.uint8).unsqueeze(1)
                     * self.colors[
-                        torch.arange(
-                            result_for_publish.masks.shape[0], device=self.device
-                        )
-                        % self.colors.shape[0]
+                        torch.arange(masks.shape[0], device=self.device) % self.colors.shape[0]
                     ].view(-1, 3, 1, 1)
                 ).amax(dim=0).to(torch.uint8)
-
                 overlay = colored_masks.permute(1, 2, 0).cpu().numpy()
-                result_image = cv2.addWeighted(
-                    result_image,
-                    1.0,
-                    overlay,
-                    0.5,
-                    0.0,
-                )
-
-                box_thickness = 3
-                font_scale = 1.2
-                text_color = (255, 255, 255)
-                text_thickness = 2
-
-                for i, (box, score) in enumerate(zip(result_for_publish.boxes, result_for_publish.scores)):
-                    x1, y1, x2, y2 = box.to(torch.int32).tolist()
-                    box_color = tuple(
-                        int(v) for v in self.colors[i % self.colors.shape[0]].cpu().tolist()
-                    )
-                    text = (
-                        f"{self.text_prompt}:{score.item():.2f}"
-                        if self.text_prompt
-                        else f"{score.item():.2f}"
-                    )
-
-                    (text_width, text_height), _ = cv2.getTextSize(
-                        text,
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                        fontScale=font_scale,
-                        thickness=text_thickness,
-                    )
-
-                    text_y1 = y1 - text_height - 8 if y1 - text_height - 8 > 0 else y1
-                    text_y2 = y1 if y1 - text_height - 8 > 0 else y1 + text_height + 8
-
-                    cv2.rectangle(
-                        result_image,
-                        (x1, y1),
-                        (x2, y2),
-                        color=box_color,
-                        thickness=box_thickness,
-                    )
-                    cv2.rectangle(
-                        result_image,
-                        (x1, text_y1),
-                        (x1 + text_width + 8, text_y2),
-                        color=box_color,
-                        thickness=cv2.FILLED,
-                    )
-                    cv2.putText(
-                        result_image,
-                        text,
-                        (x1 + 4, text_y2 - 4),
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                        fontScale=font_scale,
-                        color=text_color,
-                        thickness=text_thickness,
-                    )
-
-            result_image_msg = self.cv_bridge.cv2_to_imgmsg(result_image, encoding="bgr8")
+                annotated = cv2.addWeighted(image, 1.0, overlay, 0.5, 0.0)
+            result_image_msg = self.cv_bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
             result_image_msg.header = header
             self.result_image_pub.publish(result_image_msg)
-            self.get_logger().info(f"[Inference {inference_id}] Published result_image")
+            self.get_logger().debug(f"[Inference {inference_id}] Published result_image")
 
             detections = vision_msgs.msg.Detection2DArray()
             detections.header = header
@@ -562,12 +562,15 @@ class Segmentation(rclpy.node.Node):
                 detections.detections.append(detection)
 
             self.detections_pub.publish(detections)
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[Inference {inference_id}] Published detections, count={len(detections.detections)}"
             )
 
+            self._extract_and_publish_boundaries(masks, header, orig_h, orig_w, infer_h, infer_w)
+
             self.get_logger().info(
-                f"[Inference {inference_id}] Finished in {time.time() - total_start:.3f}s"
+                f"[Inference {inference_id}] Finished in {time.time() - total_start:.3f}s, "
+                f"detections={len(detections.detections)}"
             )
 
         except Exception as e:
@@ -575,6 +578,88 @@ class Segmentation(rclpy.node.Node):
                 f"[Inference {inference_id}] Exception: {type(e).__name__}: {e}"
             )
             self.get_logger().error(traceback.format_exc())
+
+    @staticmethod
+    def _classify_boundaries_using_horizontal_bins(
+        contour_points: numpy.ndarray, frame_height: int, num_bins: int = 50
+    ) -> tuple[list, list]:
+        if len(contour_points) == 0:
+            return [], []
+        y_min = int(contour_points[:, 1].min())
+        bin_height = max(1, (frame_height - y_min) // num_bins)
+        left_pts: list = []
+        right_pts: list = []
+        for i in range(num_bins):
+            y_lo = y_min + i * bin_height
+            y_hi = y_min + (i + 1) * bin_height
+            bin_pts = contour_points[
+                (contour_points[:, 1] > y_lo) & (contour_points[:, 1] <= y_hi)
+            ]
+            if len(bin_pts) > 0:
+                mean_x = bin_pts[:, 0].mean()
+                for pt in bin_pts:
+                    (left_pts if pt[0] < mean_x else right_pts).append(pt)
+        return left_pts, right_pts
+
+    def _extract_and_publish_boundaries(
+        self,
+        masks: torch.Tensor,
+        header: std_msgs.msg.Header,
+        orig_h: int,
+        orig_w: int,
+        infer_h: int,
+        infer_w: int,
+    ) -> None:
+        MIN_CONTOUR_AREA = 1000.0
+        try:
+            if masks.shape[0] == 0:
+                return
+
+            # Use the union of all masks as the road mask
+            road_mask_bool = masks.any(dim=0)
+            road_mask = road_mask_bool.cpu().numpy().astype(numpy.uint8)
+
+            kernel = numpy.ones((6, 6), numpy.uint8)
+            road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(
+                road_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+            )
+            if not contours:
+                return
+
+            road_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(road_contour) < MIN_CONTOUR_AREA:
+                return
+
+            contour_points = numpy.array(road_contour).reshape(-1, 2).astype(numpy.float32)
+
+            left_pts, right_pts = self._classify_boundaries_using_horizontal_bins(
+                contour_points, infer_h
+            )
+
+            # Scale boundary points back to original image coordinates
+            scale_x = orig_w / infer_w
+            scale_y = orig_h / infer_h
+
+            def _to_msg(pts: list) -> DetectedRoadArea:
+                msg = DetectedRoadArea()
+                msg.header = header
+                arr = numpy.array(pts, dtype=numpy.float32)
+                arr[:, 0] *= scale_x
+                arr[:, 1] *= scale_y
+                msg.road_area.data = arr.flatten().tolist()
+                return msg
+
+            if left_pts:
+                self.left_contour_pub.publish(_to_msg(left_pts))
+            if right_pts:
+                self.right_contour_pub.publish(_to_msg(right_pts))
+
+        except Exception as e:
+            self.get_logger().error(
+                f"Exception in _extract_and_publish_boundaries: {type(e).__name__}: {e}"
+            )
 
     def _visualize_result(self) -> None:
         try:

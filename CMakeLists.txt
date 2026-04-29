@@ -11,6 +11,7 @@ ament_python_install_package(${PROJECT_NAME} PACKAGE_DIR src/${PROJECT_NAME})
 install(
   PROGRAMS
     scripts/segmentation_node
+    scripts/sam3_mask_transform_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
