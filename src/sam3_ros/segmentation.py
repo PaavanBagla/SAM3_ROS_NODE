@@ -55,12 +55,12 @@ class Segmentation(rclpy.node.Node):
             .bool_value
         )
         self.text_prompt = (
-            self.declare_parameter("text_prompt", "asphalt, tarmac, road")
+            self.declare_parameter("text_prompt", "gravel road, asphalt, tarmac, road")
             .get_parameter_value()
             .string_value
         )
         confidence_threshold = (
-            self.declare_parameter("confidence_threshold", 0.5)
+            self.declare_parameter("confidence_threshold", 0.3)
             .get_parameter_value()
             .double_value
         )
