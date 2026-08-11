@@ -16,19 +16,20 @@ Logic is a direct port of samv2_mask_transform.py adapted for SAM3 topics.
 """
 
 import os
-import threading
 import time as _time
 
 from ament_index_python.packages import get_package_share_directory
 import numpy as np
 import ros2_numpy as ros_numpy
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 import yaml
 from scipy.spatial import KDTree
 
+from perception_common.utils import LatestStampedCache
 from sam2_msgs.msg import DetectedRoadArea
 
 TOPICS_PATH = os.path.join(
@@ -81,13 +82,13 @@ class Sam3MaskTransform(Node):
             .get_parameter_value()
             .string_value
         )
-        sync_queue_size = int(
-            self.declare_parameter("sync_queue_size", 20)
+        qos_depth = int(
+            self.declare_parameter("qos_depth", 20)
             .get_parameter_value()
             .integer_value
         )
-        sync_slop = float(
-            self.declare_parameter("sync_slop", 0.6)
+        max_detection_age = float(
+            self.declare_parameter("max_detection_age", 0.25)
             .get_parameter_value()
             .double_value
         )
@@ -102,44 +103,85 @@ class Sam3MaskTransform(Node):
             PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
         ]
 
-        self._sync_slop = max(0.0, sync_slop)
-        self._cache_lock = threading.Lock()
-        self._last_left: DetectedRoadArea | None = None
-        self._last_right: DetectedRoadArea | None = None
-        self._last_left_recv: float = 0.0
-        self._last_right_recv: float = 0.0
+        # Contours arrive at ~5 Hz against ~10 Hz LiDAR, so the projection drives the
+        # output and pulls the cached contours. A contour is released only when its
+        # header stamp is within max_detection_age of the cloud's stamp — i.e. the two
+        # were captured close together, not merely received close together. SAM3
+        # inference latency means a contour can arrive fresh while describing a stale
+        # image, which an arrival-time check cannot detect. Comparing the two message
+        # stamps to each other (never to the node clock) also keeps this valid under
+        # bag replay without any use_sim_time configuration.
+        self._max_detection_age = max(0.0, max_detection_age)
+        self._left_cache = LatestStampedCache("left_contour")
+        self._right_cache = LatestStampedCache("right_contour")
+        self._last_stale_log = 0.0
 
-        self.create_subscription(DetectedRoadArea, left_contour_topic, self._left_cb, sync_queue_size)
-        self.create_subscription(DetectedRoadArea, right_contour_topic, self._right_cb, sync_queue_size)
-        self.create_subscription(PointCloud2, lidar_topic, self._lidar_cb, sync_queue_size)
+        self.create_subscription(DetectedRoadArea, left_contour_topic, self._left_cb, qos_depth)
+        self.create_subscription(DetectedRoadArea, right_contour_topic, self._right_cb, qos_depth)
+        self.create_subscription(PointCloud2, lidar_topic, self._lidar_cb, qos_depth)
+
+        # The right bound depends on the segmenter's end-to-end latency, which is
+        # easiest to measure against a replaying bag. Keep it settable at runtime so
+        # it can be calibrated without restarting the node.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         self.get_logger().info(
             f"Sam3MaskTransform ready: {lidar_topic} + {left_contour_topic} + {right_contour_topic}, "
-            f"slop={sync_slop:.3f}s queue={sync_queue_size} (arrival-time sync)"
+            f"max_detection_age={self._max_detection_age:.3f}s qos_depth={qos_depth} "
+            f"(capture-time sync)"
         )
 
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        # Validate every parameter before applying any, so a rejected request cannot
+        # leave the node half-updated.
+        for p in params:
+            if p.name == "max_detection_age" and float(p.value) < 0.0:
+                return SetParametersResult(
+                    successful=False, reason="max_detection_age must be >= 0"
+                )
+        for p in params:
+            if p.name == "max_detection_age":
+                self._max_detection_age = float(p.value)
+                self.get_logger().info(
+                    f"max_detection_age set to {self._max_detection_age:.3f}s"
+                )
+        return SetParametersResult(successful=True)
+
     def _left_cb(self, msg: DetectedRoadArea) -> None:
-        with self._cache_lock:
-            self._last_left = msg
-            self._last_left_recv = _time.monotonic()
+        self._left_cache.update(msg)
 
     def _right_cb(self, msg: DetectedRoadArea) -> None:
-        with self._cache_lock:
-            self._last_right = msg
-            self._last_right_recv = _time.monotonic()
+        self._right_cache.update(msg)
 
     def _lidar_cb(self, msg_proj: PointCloud2) -> None:
-        now = _time.monotonic()
-        with self._cache_lock:
-            left = self._last_left
-            right = self._last_right
-            left_age = now - self._last_left_recv
-            right_age = now - self._last_right_recv
+        left, left_skew = self._left_cache.get_fresh(
+            msg_proj.header, self._max_detection_age
+        )
+        right, right_skew = self._right_cache.get_fresh(
+            msg_proj.header, self._max_detection_age
+        )
         if left is None or right is None:
-            return
-        if left_age > self._sync_slop or right_age > self._sync_slop:
+            self._log_stale(left_skew, right_skew)
             return
         self.callback(msg_proj, left, right)
+
+    def _log_stale(self, left_skew: float, right_skew: float) -> None:
+        """Rate-limited warning so a stalled segmenter is visible instead of silent."""
+        now = _time.monotonic()
+        if now - self._last_stale_log < 1.0:
+            return
+        self._last_stale_log = now
+
+        def describe(skew: float) -> str:
+            return "none yet" if skew == float("inf") else f"{skew:.3f}s"
+
+        dropped = self._left_cache.rejected_count + self._right_cache.rejected_count
+        self.get_logger().warning(
+            f"Dropping projection: contours stale (left skew={describe(left_skew)}, "
+            f"right skew={describe(right_skew)}, "
+            f"max_detection_age={self._max_detection_age:.3f}s); "
+            f"dropped={dropped} fused={self._left_cache.accepted_count}"
+        )
 
     def callback(
         self,
