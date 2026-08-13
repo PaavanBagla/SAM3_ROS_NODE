@@ -74,6 +74,21 @@ class Segmentation(rclpy.node.Node):
             .get_parameter_value()
             .integer_value
         )
+        # The debayered /camera_fl/image_color arrives ~0.5s behind its own capture
+        # stamp because image_proc runs a permanent backlog, and every millisecond of
+        # that lands in the contour-to-LiDAR skew downstream. The raw Bayer topic is
+        # ~0.02s behind, a third of the bandwidth, and cv_bridge debayers it here for
+        # a few milliseconds of CPU.
+        image_topic = (
+            self.declare_parameter("image_topic", "/camera_fl/image")
+            .get_parameter_value()
+            .string_value
+        )
+        compressed_image_topic = (
+            self.declare_parameter("compressed_image_topic", "image/compressed")
+            .get_parameter_value()
+            .string_value
+        )
         left_contour_topic = (
             self.declare_parameter("left_contour_topic", "/sam3_left_contour")
             .get_parameter_value()
@@ -150,22 +165,28 @@ class Segmentation(rclpy.node.Node):
         # Cached prompt parse: avoid re-parsing regex every frame
         self._cached_prompt_parse: dict = {}
 
+        # Async inference: callbacks drop frames into a maxsize=1 queue; worker thread
+        # pops and runs inference so the ROS executor is never blocked. Created before
+        # the subscriptions so no callback can ever reach a queue that does not exist.
+        self._infer_queue: queue.Queue = queue.Queue(maxsize=1)
+        self.superseded_frame_count = 0
+
         if use_compressed_image:
             self.image_sub = self.create_subscription(
                 sensor_msgs.msg.CompressedImage,
-                "image/compressed",
+                compressed_image_topic,
                 self._image_compressed_callback,
                 rclpy.qos.qos_profile_sensor_data,
             )
-            self.get_logger().info("Subscribed to topic: image/compressed")
+            self.get_logger().info(f"Subscribed to topic: {compressed_image_topic}")
         else:
             self.image_sub = self.create_subscription(
                 sensor_msgs.msg.Image,
-                "/camera_fl/image_color",
+                image_topic,
                 self._image_callback,
                 rclpy.qos.qos_profile_sensor_data,
             )
-            self.get_logger().info("Subscribed to topic: image")
+            self.get_logger().info(f"Subscribed to topic: {image_topic}")
 
         if result_visualization_rate > 0.0:
             self.result_image_compressed_pub = self.create_publisher(
@@ -182,9 +203,6 @@ class Segmentation(rclpy.node.Node):
 
         self.get_logger().info("Segmentation node ready. Waiting for images...")
 
-        # Async inference: callbacks drop frames into a maxsize=1 queue; worker thread
-        # pops and runs inference so the ROS executor is never blocked.
-        self._infer_queue: queue.Queue = queue.Queue(maxsize=1)
         self._infer_thread = threading.Thread(
             target=self._inference_worker, daemon=True, name="sam3_infer"
         )
@@ -206,15 +224,30 @@ class Segmentation(rclpy.node.Node):
 
         return numpy.ascontiguousarray(image)
 
+    def _enqueue_latest(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
+        """Queue a frame for inference, discarding any frame it supersedes.
+
+        Dropping the *incoming* frame instead would leave inference to start on the
+        oldest frame of the busy window — up to one inference period stale before the
+        model even sees it. Single-producer, so the drain-then-put is not racy.
+        """
+        while True:
+            try:
+                self._infer_queue.put_nowait((image, header))
+                return
+            except queue.Full:
+                try:
+                    self._infer_queue.get_nowait()
+                    self.superseded_frame_count += 1
+                except queue.Empty:
+                    pass
+
     def _image_compressed_callback(self, msg: sensor_msgs.msg.CompressedImage) -> None:
         self.received_frame_count += 1
         try:
             image = self.cv_bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
             image = self._normalize_input_image(image)
-            try:
-                self._infer_queue.put_nowait((image, msg.header))
-            except queue.Full:
-                pass  # drop frame — inference still busy
+            self._enqueue_latest(image, msg.header)
         except Exception as e:
             self.get_logger().error(
                 f"Exception in _image_compressed_callback: {type(e).__name__}: {e}"
@@ -224,12 +257,11 @@ class Segmentation(rclpy.node.Node):
     def _image_callback(self, msg: sensor_msgs.msg.Image) -> None:
         self.received_frame_count += 1
         try:
+            # desired_encoding="bgr8" makes cv_bridge debayer bayer_rggb8 input,
+            # matching what image_proc would have produced.
             image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             image = self._normalize_input_image(image)
-            try:
-                self._infer_queue.put_nowait((image, msg.header))
-            except queue.Full:
-                pass  # drop frame — inference still busy
+            self._enqueue_latest(image, msg.header)
         except Exception as e:
             self.get_logger().error(f"Exception in _image_callback: {type(e).__name__}: {e}")
             self.get_logger().error(traceback.format_exc())
@@ -570,7 +602,8 @@ class Segmentation(rclpy.node.Node):
 
             self.get_logger().info(
                 f"[Inference {inference_id}] Finished in {time.time() - total_start:.3f}s, "
-                f"detections={len(detections.detections)}"
+                f"detections={len(detections.detections)}, "
+                f"superseded={self.superseded_frame_count}"
             )
 
         except Exception as e:

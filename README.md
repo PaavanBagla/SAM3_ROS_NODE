@@ -111,24 +111,49 @@ ros2 run sam3_ros segmentation_node
 
 ### Subscribed
 
-| Topic               | Type                              | Description            |
-| ------------------- | --------------------------------- | ---------------------- |
-| `/image`            | `sensor_msgs/msg/Image`           | Raw input image        |
-| `/image/compressed` | `sensor_msgs/msg/CompressedImage` | Compressed input image |
+| Topic                     | Type                              | Description                                                      |
+| ------------------------- | --------------------------------- | ---------------------------------------------------------------- |
+| `/camera_fl/image`        | `sensor_msgs/msg/Image`           | Raw input image; Bayer input is debayered by `cv_bridge`         |
+| `/image/compressed`       | `sensor_msgs/msg/CompressedImage` | Compressed input image (when `use_compressed_image` is `true`)   |
+| `/lidar_2d_projection`    | `sensor_msgs/msg/PointCloud2`     | LiDAR points carrying `x,y,z,u,v` (`sam3_mask_transform` only)   |
+| `/sam3_{left,right}_contour` | `sam2_msgs/msg/DetectedRoadArea` | Boundary pixels to lift into 3D (`sam3_mask_transform` only)     |
+
+Prefer the raw camera topic over a debayered one: on this stack `image_proc` runs a
+persistent backlog that puts `/camera_fl/image_color` ~0.5s behind its own capture
+stamp, and that delay propagates into every contour.
 
 ### Published
 
-| Topic                       | Type                               | Description                                     |
-| --------------------------- | ---------------------------------- | ----------------------------------------------- |
-| `~/mask_image/compressed`   | `sensor_msgs/msg/CompressedImage`  | Mask image (pixel value corresponds to mask ID) |
-| `~/detections`              | `vision_msgs/msg/Detection2DArray` | Bounding boxes of detected masks                |
-| `~/result_image/compressed` | `sensor_msgs/msg/CompressedImage`  | Image with colored masks for visualization      |
+| Topic                          | Type                               | Description                                     |
+| ------------------------------ | ---------------------------------- | ----------------------------------------------- |
+| `~/mask_image/compressed`      | `sensor_msgs/msg/CompressedImage`  | Mask image (pixel value corresponds to mask ID) |
+| `~/detections`                 | `vision_msgs/msg/Detection2DArray` | Bounding boxes of detected masks                |
+| `~/result_image/compressed`    | `sensor_msgs/msg/CompressedImage`  | Image with colored masks for visualization      |
+| `/sam3_{left,right}_contour`   | `sam2_msgs/msg/DetectedRoadArea`   | Road boundary pixels, in original image scale   |
+| `/sam3_{left,right}_boundary`  | `sensor_msgs/msg/PointCloud2`      | Road boundary in 3D (`sam3_mask_transform`)     |
 
 ## ⚙️ Parameters
 
+### `segmentation_node`
+
 | Parameter                   | Type     | Description                                                                             | Default |
 | --------------------------- | -------- | --------------------------------------------------------------------------------------- | ------- |
+| `image_topic`               | `string` | Raw image topic to segment                                                              | `/camera_fl/image` |
+| `compressed_image_topic`    | `string` | Compressed image topic, used when `use_compressed_image` is `true`                      | `image/compressed` |
 | `use_compressed_image`      | `bool`   | Use compressed image input. If `true`, subscribes to `/image/compressed`, else `/image` | `true`  |
 | `text_prompt`               | `string` | Text prompt for guided segmentation                                                     | `""`    |
 | `confidence_threshold`      | `float`  | Minimum confidence threshold for mask filtering                                         | `0.5`   |
 | `result_visualization_rate` | `float`  | Publish rate (Hz) for visualization results                                             | `10.0`  |
+
+### `sam3_mask_transform_node`
+
+Each contour is fused against the buffered LiDAR projection captured nearest to the
+contour's own header stamp, so camera and inference latency delay *when* a boundary
+appears without displacing *where* its points land.
+
+| Parameter                     | Type    | Description                                                                                          | Default |
+| ----------------------------- | ------- | ---------------------------------------------------------------------------------------------------- | ------- |
+| `max_pairing_skew`            | `float` | Largest capture-time gap (s) allowed between a contour and the projection it is fused with           | `0.08`  |
+| `projection_buffer_duration`  | `float` | How much projection history (s) to retain; must exceed camera-to-contour latency                     | `2.0`   |
+| `boundary_timeout`            | `float` | Publish an empty boundary once a side has gone this long (s) without a refresh; `0` disables          | `0.5`   |
+| `qos_depth`                   | `int`   | Subscription queue depth                                                                              | `20`    |
