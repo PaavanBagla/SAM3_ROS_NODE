@@ -141,8 +141,9 @@ stamp, and that delay propagates into every contour.
 | `image_topic`               | `string` | Raw image topic to segment                                                              | `/camera_fl/image` |
 | `compressed_image_topic`    | `string` | Compressed image topic, used when `use_compressed_image` is `true`                      | `image/compressed` |
 | `use_compressed_image`      | `bool`   | Use compressed image input. If `true`, subscribes to `/image/compressed`, else `/image` | `true`  |
-| `text_prompt`               | `string` | Text prompt for guided segmentation                                                     | `""`    |
-| `confidence_threshold`      | `float`  | Minimum confidence threshold for mask filtering                                         | `0.5`   |
+| `text_prompt`               | `string` | Text prompt for guided segmentation. Terms separated by `or`/`\|` run as independent queries whose masks are unioned; `and`/`&` intersects them. Commas are **not** separators — a comma list is encoded as one literal phrase. | `road or gravel road or paved road or asphalt road or tarmac road` |
+| `confidence_threshold`      | `float`  | Minimum confidence threshold for mask filtering. Re-read every frame, so it can be swept live with `ros2 param set`. | `0.3`   |
+| `boundary_close_kernel_size`| `int`    | Diameter of the elliptical kernel that closes the road mask before contour extraction. Must exceed the width of any patch or seam that splits the road, or only the larger fragment survives. Re-read every frame. | `15` |
 | `result_visualization_rate` | `float`  | Publish rate (Hz) for visualization results                                             | `10.0`  |
 
 ### `sam3_mask_transform_node`

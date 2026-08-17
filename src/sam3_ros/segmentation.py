@@ -55,11 +55,14 @@ class Segmentation(rclpy.node.Node):
             .bool_value
         )
         self.text_prompt = (
-            self.declare_parameter("text_prompt", "gravel road, asphalt, tarmac, road")
+            self.declare_parameter(
+                "text_prompt",
+                "road or gravel road or paved road or asphalt road or tarmac road",
+            )
             .get_parameter_value()
             .string_value
         )
-        confidence_threshold = (
+        self.confidence_threshold = (
             self.declare_parameter("confidence_threshold", 0.3)
             .get_parameter_value()
             .double_value
@@ -74,6 +77,16 @@ class Segmentation(rclpy.node.Node):
             .get_parameter_value()
             .integer_value
         )
+        # A surface-colour change or a patch reaching the road edge splits the road mask
+        # in two, and only the largest contour survives boundary extraction. Closing with
+        # a kernel wider than the seam rejoins the halves first. Closing only bridges
+        # neighbouring regions, so this cannot pull a distant false positive into the road.
+        self.boundary_close_kernel_size = int(
+            self.declare_parameter("boundary_close_kernel_size", 15)
+            .get_parameter_value()
+            .integer_value
+        )
+        self._boundary_close_kernel = self._build_close_kernel(self.boundary_close_kernel_size)
         # The debayered /camera_fl/image_color arrives ~0.5s behind its own capture
         # stamp because image_proc runs a permanent backlog, and every millisecond of
         # that lands in the contour-to-LiDAR skew downstream. The raw Bayer topic is
@@ -104,7 +117,8 @@ class Segmentation(rclpy.node.Node):
         self.get_logger().info(
             f"use_compressed_image={use_compressed_image}, "
             f"text_prompt='{self.text_prompt}', "
-            f"confidence_threshold={confidence_threshold}, "
+            f"confidence_threshold={self.confidence_threshold}, "
+            f"boundary_close_kernel_size={self.boundary_close_kernel_size}, "
             f"result_visualization_rate={result_visualization_rate}, "
             f"use_amp={self.amp_enabled}"
         )
@@ -127,7 +141,7 @@ class Segmentation(rclpy.node.Node):
         self.get_logger().info("Creating processor...")
         self.processor = sam3.model.sam3_image_processor.Sam3Processor(
             self.model,
-            confidence_threshold=confidence_threshold,
+            confidence_threshold=self.confidence_threshold,
         )
         self.get_logger().info("Processor ready.")
 
@@ -456,12 +470,15 @@ class Segmentation(rclpy.node.Node):
 
         return self._run_prompt_query(expression, inference_state, image_shape, inference_id)
 
-    def _run_inference(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
-        self.inference_count += 1
-        inference_id = self.inference_count
-        total_start = time.time()
-        header = self._sanitize_header(header)
+    @staticmethod
+    def _build_close_kernel(size: int) -> numpy.ndarray:
+        # Elliptical rather than rectangular so bridging a seam does not square off the
+        # road outline the boundary classifier then splits into left and right.
+        size = max(1, int(size))
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
+    def _refresh_tunable_parameters(self, inference_id: int) -> None:
+        """Adopt live `ros2 param set` changes for the knobs worth sweeping on a bag."""
         current_prompt = self.get_parameter("text_prompt").get_parameter_value().string_value
         if current_prompt != self.text_prompt:
             self.text_prompt = current_prompt
@@ -469,6 +486,38 @@ class Segmentation(rclpy.node.Node):
             self.get_logger().info(
                 f"[Inference {inference_id}] text_prompt updated to '{self.text_prompt}'"
             )
+
+        current_threshold = (
+            self.get_parameter("confidence_threshold").get_parameter_value().double_value
+        )
+        if current_threshold != self.confidence_threshold:
+            self.confidence_threshold = current_threshold
+            # Called without a state, so it only re-arms the threshold for later queries.
+            # This frame has not run set_text_prompt yet, so the new value takes effect now.
+            self.processor.set_confidence_threshold(current_threshold)
+            self.get_logger().info(
+                f"[Inference {inference_id}] confidence_threshold updated to "
+                f"{current_threshold:.3f}"
+            )
+
+        current_kernel_size = (
+            self.get_parameter("boundary_close_kernel_size").get_parameter_value().integer_value
+        )
+        if current_kernel_size != self.boundary_close_kernel_size:
+            self.boundary_close_kernel_size = current_kernel_size
+            self._boundary_close_kernel = self._build_close_kernel(current_kernel_size)
+            self.get_logger().info(
+                f"[Inference {inference_id}] boundary_close_kernel_size updated to "
+                f"{self.boundary_close_kernel_size}"
+            )
+
+    def _run_inference(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
+        self.inference_count += 1
+        inference_id = self.inference_count
+        total_start = time.time()
+        header = self._sanitize_header(header)
+
+        self._refresh_tunable_parameters(inference_id)
 
         self.get_logger().debug(f"[Inference {inference_id}] Starting inference")
 
@@ -652,17 +701,39 @@ class Segmentation(rclpy.node.Node):
             road_mask_bool = masks.any(dim=0)
             road_mask = road_mask_bool.cpu().numpy().astype(numpy.uint8)
 
-            kernel = numpy.ones((6, 6), numpy.uint8)
-            road_mask = cv2.morphologyEx(road_mask, cv2.MORPH_CLOSE, kernel)
+            road_mask = cv2.morphologyEx(
+                road_mask, cv2.MORPH_CLOSE, self._boundary_close_kernel
+            )
 
             contours, _ = cv2.findContours(
                 road_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
             )
             if not contours:
+                self.get_logger().warn(
+                    f"Boundary drop: {masks.shape[0]} mask(s) produced no contour "
+                    f"({int(road_mask.sum())} px after close)."
+                )
                 return
 
             road_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(road_contour) < MIN_CONTOUR_AREA:
+            kept_area = cv2.contourArea(road_contour)
+
+            # A surface-colour change or a patch reaching the road edge splits the mask
+            # into several external contours; only the largest survives below. Logging
+            # the discarded share tells fragmentation apart from a weak detection.
+            if len(contours) > 1:
+                total_area = sum(cv2.contourArea(c) for c in contours)
+                self.get_logger().debug(
+                    f"Boundary fragmentation: {len(contours)} contours, keeping "
+                    f"{kept_area:.0f}px of {total_area:.0f}px "
+                    f"({100.0 * kept_area / max(total_area, 1.0):.0f}%)."
+                )
+
+            if kept_area < MIN_CONTOUR_AREA:
+                self.get_logger().warn(
+                    f"Boundary drop: largest of {len(contours)} contour(s) is "
+                    f"{kept_area:.0f}px, below MIN_CONTOUR_AREA={MIN_CONTOUR_AREA:.0f}."
+                )
                 return
 
             contour_points = numpy.array(road_contour).reshape(-1, 2).astype(numpy.float32)
