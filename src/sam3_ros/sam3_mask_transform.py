@@ -23,28 +23,38 @@ So the projections are buffered instead, and each contour is fused against the c
 captured closest to its own header stamp. Skew drops to at most half a LiDAR period,
 independent of how far behind the camera pipeline runs. The cost is that a boundary is
 published ~one pipeline latency after the scene it describes; the output carries the
-matched cloud's stamp so consumers can account for that. Stamps are only ever compared
-to each other and never to the node clock, which keeps this valid under bag replay
-without any use_sim_time configuration.
+matched cloud's stamp so consumers can account for that.
+
+Matching is two-sided: a contour with no cloud yet captured at or after it is deferred for
+up to wait_for_newer rather than forced backwards onto an older cloud. Deferred contours are
+resolved by _pump, which runs after every buffered cloud and on a short timer.
+
+Message stamps are only ever compared to each other, so the pairing itself is valid under bag
+replay regardless of use_sim_time. Deferral expiry and the watchdog do read the node clock, so
+run with use_sim_time:=true against a bag if you want them to track playback.
+
+The pairing itself lives in perception_common.stamp_sync, shared with the YOLO fusion node and
+the CLRerNet lane transform. This node used to carry its own copy; the two drifted, which is
+what the shared module exists to prevent.
 """
 
 import os
-import time as _time
-from collections import deque
-from threading import Lock
 
 from ament_index_python.packages import get_package_share_directory
 import numpy as np
-import ros2_numpy as ros_numpy
 import rclpy
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 import yaml
-from scipy.spatial import KDTree
 
-from perception_common.utils import is_zero_stamp, stamp_to_seconds
+from perception_common.stamp_sync import (
+    DEFAULT_PIXEL_LIM,
+    DEFERRED,
+    StampMatchedBuffer,
+    apply_bounded_parameters,
+)
 from sam2_msgs.msg import DetectedRoadArea
 
 TOPICS_PATH = os.path.join(
@@ -65,40 +75,12 @@ SAM3_LEFT_BOUNDARY = _sam_topics.get("left_boundary", "/sam3_left_boundary")
 SAM3_RIGHT_BOUNDARY = _sam_topics.get("right_boundary", "/sam3_right_boundary")
 
 # KDTree pixel search radius (pixels)
-PIXEL_LIM = 5
+PIXEL_LIM = DEFAULT_PIXEL_LIM
 
-
-class BufferedProjection:
-    """A buffered projection with its pixel KDTree built on first use.
-
-    Left and right contours for one frame match the same cloud, so the parse and the
-    tree build are shared between them, and clouds that no contour ever matches cost
-    nothing beyond the memory to hold them.
-    """
-
-    __slots__ = ("msg", "stamp", "_tree", "_points", "_parsed")
-
-    def __init__(self, msg: PointCloud2, stamp: float):
-        self.msg = msg
-        self.stamp = stamp
-        self._tree = None
-        self._points = None
-        self._parsed = False
-
-    def pixel_tree(self):
-        """Return ``(kdtree_over_uv, xyz_points)``, or ``(None, None)`` if empty."""
-        if not self._parsed:
-            self._parsed = True
-            cloud = ros_numpy.point_cloud2.pointcloud2_to_array(self.msg)
-            cloud = cloud[~np.isnan(cloud["x"])]
-            if cloud.size:
-                self._points = np.column_stack([cloud["x"], cloud["y"], cloud["z"]])
-                self._tree = KDTree(
-                    np.column_stack(
-                        (cloud["u"].astype(np.float32), cloud["v"].astype(np.float32))
-                    )
-                )
-        return self._tree, self._points
+# The two contour streams are paired independently, so a side that publishes nothing cannot
+# hold back the other. They still share one projection buffer, which is what keeps the parse
+# and the KDTree of a frame shared between its left and right contour.
+SIDES = ("left", "right")
 
 
 class Sam3MaskTransform(Node):
@@ -153,15 +135,53 @@ class Sam3MaskTransform(Node):
         # How long a boundary may go unrefreshed before the node publishes an empty
         # cloud. Without this a stalled segmenter leaves the last boundary standing in
         # RViz and in any consumer, which reads as valid, current geometry.
+        #
+        # This MUST stay above the SAM3 frame period, or the watchdog stops reporting "the
+        # segmenter died" and starts reporting "the segmenter is slow". Measured 2026-08-17:
+        # SAM3 inference runs 0.5-0.8s per frame (~1.5Hz) with the five-term OR prompt, and
+        # at the old 0.5s default the watchdog fired between consecutive real contours --
+        # 28% of everything published on /sam3_*_boundary was a spurious empty, so the road
+        # boundary blinked out on more than a quarter of frames. 2.0s clears a ~0.65s period
+        # with room for a missed frame. Raise it further if the prompt list grows.
         boundary_timeout = float(
-            self.declare_parameter("boundary_timeout", 0.5)
+            self.declare_parameter("boundary_timeout", 2.0)
+            .get_parameter_value()
+            .double_value
+        )
+        # How long a contour may wait for a cloud captured at or after it. Without this,
+        # matching can only reach backwards and skew doubles. Set to 0.0 to restore the old
+        # one-sided behaviour at runtime, which is the rollback if this ever starves.
+        wait_for_newer = float(
+            self.declare_parameter("wait_for_newer", 0.06)
+            .get_parameter_value()
+            .double_value
+        )
+        # Deferrals are almost always resolved by the _pump that follows each buffered cloud;
+        # this timer only bounds the wait when the projection stream stalls. Read-only because
+        # a timer period cannot be changed after construction, and silently ignoring a
+        # ros2 param set would be worse than rejecting it.
+        pump_period = float(
+            self.declare_parameter(
+                "deferral_pump_period", 0.02, ParameterDescriptor(read_only=True)
+            )
+            .get_parameter_value()
+            .double_value
+        )
+        stats_log_period = float(
+            self.declare_parameter(
+                "stats_log_period", 5.0, ParameterDescriptor(read_only=True)
+            )
             .get_parameter_value()
             .double_value
         )
 
-        self._max_pairing_skew = max(0.0, max_pairing_skew)
-        self._buffer_duration = max(0.0, buffer_duration)
         self._boundary_timeout = max(0.0, boundary_timeout)
+        self._projections = StampMatchedBuffer(
+            "projection",
+            buffer_duration=max(0.0, buffer_duration),
+            max_skew=max(0.0, max_pairing_skew),
+            wait_for_newer=max(0.0, wait_for_newer),
+        )
 
         self.publishers_by_side = {
             "left": self.create_publisher(PointCloud2, left_boundary_topic, 1),
@@ -175,12 +195,11 @@ class Sam3MaskTransform(Node):
             PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
         ]
 
-        self._buffer_lock = Lock()
-        self._projections: deque[BufferedProjection] = deque()
-        self._last_publish = {"left": 0.0, "right": 0.0}
-        self._last_unmatched_log = 0.0
-        self._matched_count = 0
-        self._unmatched_count = 0
+        # None until the first publish on that side: under sim time the node clock reads 0
+        # until /clock arrives, and 0.0 here would make the first watchdog tick see a
+        # ~1.7e9s gap and fire immediately.
+        self._last_publish = {side: None for side in SIDES}
+        self._last_unmatched_log = None
 
         # Sides are handled independently: SAM3 skips publishing a side when it finds
         # no points there, and one silent side must not hold back the other.
@@ -200,6 +219,10 @@ class Sam3MaskTransform(Node):
 
         # Fixed period, so boundary_timeout is enforced to within 0.5s of granularity.
         self._watchdog_timer = self.create_timer(0.5, self._watchdog)
+        if pump_period > 0.0:
+            self._pump_timer = self.create_timer(pump_period, self._pump)
+        if stats_log_period > 0.0:
+            self._stats_timer = self.create_timer(stats_log_period, self._log_stats)
 
         # The pairing bound and the buffer depth both depend on measured pipeline
         # latency, so keep them settable at runtime for calibration against a
@@ -208,111 +231,78 @@ class Sam3MaskTransform(Node):
 
         self.get_logger().info(
             f"Sam3MaskTransform ready: {lidar_topic} + {left_contour_topic} + {right_contour_topic}, "
-            f"max_pairing_skew={self._max_pairing_skew:.3f}s "
-            f"projection_buffer_duration={self._buffer_duration:.3f}s "
+            f"max_pairing_skew={self._projections.max_skew:.3f}s "
+            f"projection_buffer_duration={self._projections.buffer_duration:.3f}s "
+            f"wait_for_newer={self._projections.wait_for_newer:.3f}s "
             f"boundary_timeout={self._boundary_timeout:.3f}s qos_depth={qos_depth} "
+            f"use_sim_time={self.get_parameter('use_sim_time').value} "
             f"(stamp-matched pairing)"
         )
 
+    def _now(self) -> float:
+        """Seconds on the node clock -- sim time when use_sim_time is set, else wall time."""
+        return self.get_clock().now().nanoseconds * 1e-9
+
     def _on_set_parameters(self, params) -> SetParametersResult:
-        # Validate every parameter before applying any, so a rejected request cannot
-        # leave the node half-updated.
-        bounded = {
-            "max_pairing_skew": "_max_pairing_skew",
-            "projection_buffer_duration": "_buffer_duration",
-            "boundary_timeout": "_boundary_timeout",
+        targets = {
+            "max_pairing_skew": (self._projections, "max_skew"),
+            "projection_buffer_duration": (self._projections, "buffer_duration"),
+            "boundary_timeout": (self, "_boundary_timeout"),
+            "wait_for_newer": (self._projections, "wait_for_newer"),
         }
-        for p in params:
-            if p.name in bounded and float(p.value) < 0.0:
-                return SetParametersResult(
-                    successful=False, reason=f"{p.name} must be >= 0"
-                )
-        for p in params:
-            if p.name in bounded:
-                setattr(self, bounded[p.name], float(p.value))
-                self.get_logger().info(f"{p.name} set to {float(p.value):.3f}s")
+        ok, reason, applied = apply_bounded_parameters(params, targets)
+        if not ok:
+            return SetParametersResult(successful=False, reason=reason)
+        for name, value in applied:
+            self.get_logger().info(f"{name} set to {value:.3f}s")
         return SetParametersResult(successful=True)
 
     def _on_projection(self, msg: PointCloud2) -> None:
-        """Buffer the projection so a later contour can be paired against it."""
-        if is_zero_stamp(msg.header):
-            return
-        stamp = stamp_to_seconds(msg.header.stamp)
-        with self._buffer_lock:
-            self._projections.append(BufferedProjection(msg, stamp))
-            # Bag replay can jump backwards; drop the buffer rather than carrying
-            # clouds from the previous run forward as match candidates.
-            if self._projections[0].stamp > stamp:
-                self._projections.clear()
-                self._projections.append(BufferedProjection(msg, stamp))
-            cutoff = stamp - self._buffer_duration
-            while self._projections and self._projections[0].stamp < cutoff:
-                self._projections.popleft()
+        """Buffer the projection, then release any contour that was waiting for it."""
+        self._projections.add(msg)
+        # This is what resolves nearly every deferral, in the same tick the awaited cloud
+        # lands; the pump timer only matters when this stream stalls.
+        self._pump()
 
     def _on_contour(self, msg: DetectedRoadArea, side: str) -> None:
-        entry, skew = self._match_projection(msg.header)
-        if entry is None:
-            self._unmatched_count += 1
-            self._log_unmatched(side, skew)
+        # key=side keeps the two sides' pending queues independent, so a silent side never
+        # blocks the other, while both still match against one shared cloud buffer.
+        pairing = self._projections.match(
+            msg.header, now=self._now(), payload=msg, key=side
+        )
+        if pairing.outcome is not DEFERRED:
+            self._complete(pairing)
+
+    def _pump(self) -> None:
+        for pairing in self._projections.drain(self._now()):
+            self._complete(pairing)
+
+    def _complete(self, pairing) -> None:
+        if pairing.value is None:
+            self._log_unmatched(pairing.key, pairing.skew, pairing.reason)
             return
-        self._matched_count += 1
-        self._publish_boundary(msg, entry, side)
+        self._publish_boundary(pairing.payload, pairing.value, pairing.key)
 
-    def _match_projection(self, header):
-        """Return ``(projection, signed_skew)`` for the cloud nearest this contour.
-
-        ``skew`` is positive when the matched cloud was captured after the contour's
-        image, and ``float('inf')`` when there is nothing to match against.
-        """
-        if is_zero_stamp(header):
-            return None, float("inf")
-        stamp = stamp_to_seconds(header.stamp)
-
-        with self._buffer_lock:
-            candidates = list(self._projections)
-        if not candidates:
-            return None, float("inf")
-
-        best = min(candidates, key=lambda entry: abs(entry.stamp - stamp))
-        skew = best.stamp - stamp
-        if abs(skew) <= self._max_pairing_skew:
-            return best, skew
-        return None, skew
-
-    def _log_unmatched(self, side: str, skew: float) -> None:
+    def _log_unmatched(self, side: str, skew: float, reason=None) -> None:
         """Rate-limited warning so a starved or misaligned pipeline stays visible."""
-        now = _time.monotonic()
-        if now - self._last_unmatched_log < 1.0:
+        now = self._now()
+        if self._last_unmatched_log is not None and now - self._last_unmatched_log < 1.0:
             return
         self._last_unmatched_log = now
-
-        if skew == float("inf"):
-            detail = "no projection buffered (or zero-stamped header)"
-        elif skew > 0:
-            # Everything still buffered was captured after this contour's image: the
-            # cloud it should have paired with has already been evicted.
-            detail = (
-                f"nearest projection is {skew:.3f}s newer than the contour — "
-                f"contour latency exceeds projection_buffer_duration="
-                f"{self._buffer_duration:.3f}s"
-            )
-        else:
-            # No cloud as recent as the contour's image has arrived, so the LiDAR
-            # stream is stalled or running behind the camera.
-            detail = (
-                f"nearest projection is {-skew:.3f}s older than the contour — "
-                f"no projection was captured near this image"
-            )
         self.get_logger().warning(
-            f"Unmatched {side} contour: {detail}; "
-            f"max_pairing_skew={self._max_pairing_skew:.3f}s "
-            f"matched={self._matched_count} unmatched={self._unmatched_count}"
+            f"Unmatched {side} contour: "
+            f"{self._projections.describe_unmatched(skew, 'contour', reason=reason)}; "
+            f"{self._projections.status()}"
         )
+
+    def _log_stats(self) -> None:
+        """Periodic pairing health, so a skew regression is visible without instrumentation."""
+        self.get_logger().info(f"pairing: {self._projections.status()}")
 
     def _publish_boundary(
         self,
         msg: DetectedRoadArea,
-        entry: BufferedProjection,
+        entry,
         side: str,
     ) -> None:
         data = np.asarray(msg.road_area.data, dtype=np.float32)
@@ -329,13 +319,13 @@ class Sam3MaskTransform(Node):
 
         # Published even when empty: an absent boundary must read as absent
         # downstream rather than as the last one that happened to work.
-        self.create_cloud(points_3d, self.publishers_by_side[side], entry.msg.header)
-        self._last_publish[side] = _time.monotonic()
+        self.create_cloud(points_3d, self.publishers_by_side[side], entry.header)
+        self._last_publish[side] = self._now()
 
     def find_matching_points_kdtree(
         self,
         boundary_points: np.ndarray,
-        tree: KDTree,
+        tree,
         pc_arr: np.ndarray,
     ) -> np.ndarray:
         # Neighbouring contour pixels resolve to the same LiDAR returns, so the raw
@@ -351,16 +341,17 @@ class Sam3MaskTransform(Node):
         """Publish empty boundaries while a side is not being refreshed."""
         if self._boundary_timeout <= 0.0:
             return
-        with self._buffer_lock:
-            newest = self._projections[-1] if self._projections else None
+        newest = self._projections.newest()
         if newest is None:
             return
 
-        now = _time.monotonic()
+        now = self._now()
         empty = np.empty((0, 3), dtype=np.float32)
         for side, last in self._last_publish.items():
+            if last is None:
+                continue
             if now - last > self._boundary_timeout:
-                self.create_cloud(empty, self.publishers_by_side[side], newest.msg.header)
+                self.create_cloud(empty, self.publishers_by_side[side], newest.header)
 
     def create_cloud(
         self,
