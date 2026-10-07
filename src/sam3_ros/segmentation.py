@@ -12,6 +12,7 @@ import numpy
 import rclpy
 import rclpy.callback_groups
 import rclpy.node
+import rclpy.parameter
 import rclpy.qos
 import sam3
 import sam3.model.sam3_image_processor
@@ -24,6 +25,10 @@ import vision_msgs.msg
 from sam2_msgs.msg import DetectedRoadArea
 
 from sam3_ros.road_mask_boundary import ego_component, rowwise_boundary
+
+# cuda_graphs: passes per prompt-term count that compile (1st) and record (2nd) before
+# replays start. Every measured run took two long passes, then ~0.1 s, then steady state.
+GRAPH_WARMUP_PASSES = 2
 
 
 class Segmentation(rclpy.node.Node):
@@ -130,16 +135,28 @@ class Segmentation(rclpy.node.Node):
         # mode="reduce-overhead"). The pass is many small, launch-bound kernels; replaying them
         # as one graph removes the per-kernel launch cost. Measured on GPU 1, idle machine:
         # grounding 56 -> 37 ms, batched total 123 -> 104 ms, masks identical (IoU >= 0.998).
-        # COST: ~70 s of compiling and recording on the first two frames, and again whenever the
-        # number of prompt terms changes. Off by default; only the batched path uses it.
+        # COST -- a WARM-UP: the first two passes for a given number of prompt terms compile and
+        # record (measured: ~70 s idle / ~166 s under the full stack with an empty compile cache,
+        # ~16 s idle / ~47 s under load with a warm one). Enabled at start-up, the node does this
+        # on a blank image before it takes any image, so "ready" means ready. Enabled at runtime,
+        # or when a prompt change alters the term count, the next one or two live frames pay it
+        # and SAM3 publishes nothing meanwhile; both cases log a warning when it starts and when
+        # it ends. Changing the words with the same term count, or going back to a count already
+        # recorded, costs nothing.
+        # Off by default; only the batched path uses it.
         self.cuda_graphs = bool(self.declare_parameter("cuda_graphs", False).value)
         self._ground_compiled = None
+        self._graph_calls: dict = {}    # prompt-term count -> compiled passes run (warm-up ends at 2)
+        self._graph_t0: dict = {}
+        self._graphs_unused_key = None
+        self._warming_up = False
         # Persist compiled kernels across restarts: with a warm cache the first two frames take
         # ~16 s instead of ~74 s (idle machine). The default sits in the Hugging Face cache, which
         # the compose file already mounts from the host. Compiler worker threads are capped so the
         # one-off compile does not take every core while the rest of the vehicle software runs.
         cache_dir = str(self.declare_parameter(
             "compile_cache_dir", "/root/.cache/huggingface/torchinductor_sam3").value)
+        self._compile_cache_dir = cache_dir
         compile_threads = int(self.declare_parameter("compile_threads", 4).value)
         if cache_dir:
             # Assigned, not setdefault: importing sam3 already makes torch fill in a default under
@@ -285,12 +302,18 @@ class Segmentation(rclpy.node.Node):
                 f"Visualization timer started at {result_visualization_rate:.2f} Hz"
             )
 
-        self.get_logger().info("Segmentation node ready. Waiting for images...")
-
+        # cuda_graphs: torch keeps its CUDA-graph tree manager in thread-local state, so graphs
+        # can only be RECORDED on the thread that recorded the first ones (replaying works from
+        # any thread). The start-up warm-up therefore runs on the inference thread, which is
+        # where a later term-count change records too; nothing is spinning yet, so waiting
+        # here keeps every image callback until the node is really ready.
+        self._warm_done = threading.Event()
         self._infer_thread = threading.Thread(
             target=self._inference_worker, daemon=True, name="sam3_infer"
         )
         self._infer_thread.start()
+        self._warm_done.wait()
+        self.get_logger().info("Segmentation node ready. Waiting for images...")
 
     def _normalize_input_image(self, image: numpy.ndarray) -> numpy.ndarray:
         if image is None:
@@ -347,6 +370,11 @@ class Segmentation(rclpy.node.Node):
         return self._normalize_input_image(image)
 
     def _inference_worker(self) -> None:
+        try:
+            if self.cuda_graphs:
+                self._warm_up_cuda_graphs()
+        finally:
+            self._warm_done.set()
         while True:
             item = self._infer_queue.get()
             if item is None:
@@ -471,11 +499,117 @@ class Segmentation(rclpy.node.Node):
             enc._encode_boxes = torch.compiler.disable(enc._encode_boxes)
             self._ground_compiled = torch.compile(self.model.forward_grounding,
                                                   mode="reduce-overhead", dynamic=False)
-            self.get_logger().info(
-                "cuda_graphs: compiling the batched grounding pass; the first two frames take "
-                "~70 s idle, ~3 min under load, or ~16 s idle with a warm compile cache "
-                f"({os.environ.get('TORCHINDUCTOR_CACHE_DIR')})")
+            self._check_compile_cache()
         return self._ground_compiled
+
+    def _check_compile_cache(self) -> None:
+        """Warn when compiled kernels will not survive a restart, so every start pays the cold warm-up."""
+        cache = self._compile_cache_dir
+        cold = "every start then compiles from scratch (~70 s idle, ~3 min under the full stack)"
+        if not cache:
+            self.get_logger().warning(
+                f"cuda_graphs: compile_cache_dir is empty, so kernels go to torch's default under "
+                f"/tmp inside the container; {cold}.")
+            return
+        try:
+            os.makedirs(cache, exist_ok=True)
+            writable = os.access(cache, os.W_OK)
+        except OSError:
+            writable = False
+        if not writable:
+            self.get_logger().warning(f"cuda_graphs: compile_cache_dir {cache} is not writable; {cold}.")
+        elif os.path.exists("/.dockerenv") and self._mount_point(cache) == "/":
+            self.get_logger().warning(
+                f"cuda_graphs: compile_cache_dir {cache} is not on a mounted volume, so it is lost "
+                f"when the container is recreated (compose down/up) and {cold}. The compose file "
+                f"mounts ~/.cache/huggingface for this.")
+
+    @staticmethod
+    def _mount_point(path: str):
+        """The mount point holding ``path`` (from /proc/self/mountinfo), or None if unreadable."""
+        path, best = os.path.realpath(path), "/"
+        try:
+            with open("/proc/self/mountinfo") as f:
+                for line in f:
+                    mp = line.split()[4].replace("\\040", " ")
+                    if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) > len(best):
+                        best = mp
+        except OSError:
+            return None
+        return best
+
+    def _graph_warmup_estimate(self) -> str:
+        cache = self._compile_cache_dir
+        if cache and os.path.isdir(cache) and any(os.scandir(cache)):
+            return ("~16 s idle / ~47 s under the full stack if this term count was compiled before "
+                    f"(cache {cache}), else ~70 s idle / ~3 min under load")
+        return "~70 s idle / ~3 min under the full stack (compile cache empty)"
+
+    def _graph_pass_begin(self, k: int, terms) -> None:
+        """Warn when a pass for ``k`` prompt terms will compile and record instead of replaying."""
+        if k in self._graph_t0:
+            return
+        self._graph_t0[k] = time.time()
+        if self._warming_up:
+            what = ("compiling and recording the batched grounding pass on a blank image before "
+                    "any image is processed; the node is not ready until 'cuda_graphs: ready'")
+        else:
+            what = (f"no recorded graph for {k} prompt terms yet (cuda_graphs just enabled, or a prompt "
+                    "change altered the term count): the next one or two frames compile and record it, SAM3 "
+                    "publishes NOTHING meanwhile and its boundaries go empty downstream. Change the "
+                    "term count only with the vehicle stopped, or set it at start-up")
+        self.get_logger().warning(
+            f"cuda_graphs WARM-UP: {what}. Expect {self._graph_warmup_estimate()}. Terms: {list(terms)}")
+
+    def _graph_pass_end(self, k: int) -> None:
+        n = self._graph_calls.get(k, 0) + 1
+        self._graph_calls[k] = n
+        if n == GRAPH_WARMUP_PASSES:
+            self.get_logger().info(
+                f"cuda_graphs: ready for {k} prompt terms after {time.time() - self._graph_t0[k]:.1f} s "
+                "of warm-up; replaying recorded graphs from now on")
+
+    def _disable_cuda_graphs(self, exc: Exception) -> None:
+        self.get_logger().error(
+            f"cuda_graphs: compiling or replaying failed ({type(exc).__name__}: {exc}); falling back "
+            "to the eager pass and setting cuda_graphs to false\n" + traceback.format_exc())
+        self.cuda_graphs = False
+        self.set_parameters([rclpy.parameter.Parameter("cuda_graphs", value=False)])
+
+    def _warm_up_cuda_graphs(self) -> None:
+        """Pay the cuda_graphs warm-up at start-up, on a blank image, instead of on live frames."""
+        if self.device.type != "cuda":
+            self.get_logger().warning("cuda_graphs needs a CUDA device; ignored on CPU")
+            return
+        road = self._or_terms(self.text_prompt) if self.batch_prompts else None
+        obs = self._or_terms(self.obstacle_prompt) if self.obstacle_prompt.strip() else []
+        if not road or obs is None:
+            self._warn_graphs_unused()
+            return
+        terms = road + obs
+        blank = numpy.zeros((self.input_max_size * 3 // 4, self.input_max_size, 3), numpy.uint8)
+        self._warming_up = True
+        try:
+            # One pass past the warm-up, so the first live frame also skips the slower first replay.
+            for _ in range(GRAPH_WARMUP_PASSES + 1):
+                with torch.inference_mode(), torch.autocast(
+                        "cuda", enabled=self.amp_enabled, dtype=torch.float16):
+                    state = self.processor.set_image(self._prepare_image_tensor(blank))
+                self._run_terms_batched(terms, state, blank.shape[:2], inference_id=0)
+        except Exception as e:     # noqa: BLE001 -- never let the warm-up keep the node from starting
+            self._disable_cuda_graphs(e)
+        finally:
+            self._warming_up = False
+            self._prompt_stats = {}
+
+    def _warn_graphs_unused(self) -> None:
+        """cuda_graphs is on but the prompts take the per-term path, which it does not cover."""
+        key = (self.text_prompt, self.obstacle_prompt, self.batch_prompts)
+        if key != self._graphs_unused_key:
+            self._graphs_unused_key = key
+            self.get_logger().warning(
+                "cuda_graphs is on but has no effect: it only covers the batched path, and "
+                "batch_prompts is false or a prompt uses AND")
 
     @staticmethod
     def _or_terms(expression: str):
@@ -501,9 +635,22 @@ class Segmentation(rclpy.node.Node):
                              text_ids=torch.arange(k, device=self.device, dtype=torch.long),
                              input_boxes=None, input_boxes_mask=None, input_boxes_label=None,
                              input_points=None, input_points_mask=None)
-            out = self._grounding_fn()(
-                backbone_out=inference_state["backbone_out"], find_input=find,
-                geometric_prompt=self.model._get_dummy_prompt(num_prompts=k), find_target=None)
+            args = dict(backbone_out=inference_state["backbone_out"], find_input=find,
+                        geometric_prompt=self.model._get_dummy_prompt(num_prompts=k), find_target=None)
+            graphs = self.cuda_graphs and self.device.type == "cuda"
+            warm = graphs and self._graph_calls.get(k, 0) < GRAPH_WARMUP_PASSES
+            if warm:
+                self._graph_pass_begin(k, terms)
+            try:
+                out = self._grounding_fn()(**args)
+            except Exception as e:     # noqa: BLE001
+                if not graphs:
+                    raise
+                self._disable_cuda_graphs(e)
+                warm = False
+                out = self.model.forward_grounding(**args)
+            if warm:
+                self._graph_pass_end(k)
             probs = (out["pred_logits"].sigmoid()
                      * out["presence_logit_dec"].sigmoid().unsqueeze(1)).squeeze(-1)
             h, w = inference_state["original_height"], inference_state["original_width"]
@@ -767,6 +914,8 @@ class Segmentation(rclpy.node.Node):
                 masks, boxes, scores = self._concat(parts[:len(road_terms)], image.shape[:2])
                 obs_masks = self._concat(parts[len(road_terms):], image.shape[:2])[0]
             else:
+                if self.cuda_graphs:
+                    self._warn_graphs_unused()
                 masks, boxes, scores = self._run_prompt_expression(
                     inference_state=inference_state,
                     image_shape=image.shape[:2],
