@@ -114,6 +114,16 @@ class Segmentation(rclpy.node.Node):
         # 177 -> 123 ms for four terms on an idle machine, 269 -> 143 ms with the full stack running,
         # because the per-term path is many small, launch-bound kernels. false restores per-term.
         self.batch_prompts = bool(self.declare_parameter("batch_prompts", True).value)
+        # Per-stage timing of every inference, logged every prompt_stats_period frames. Off by
+        # default: it synchronises the GPU at each stage boundary so GPU work is attributed to the
+        # stage that queued it, which itself costs a little.
+        self.profile_stages = bool(self.declare_parameter("profile_stages", False).value)
+        # Row-wise boundary extraction runs on the mask downsampled by this factor. Hole filling
+        # and labelling cost scales with pixel count: 70-90 ms per frame at 1024x766 under the
+        # full stack. At 2 a boundary pixel is still within 2 px at 1024 width. 1 disables.
+        self.boundary_downsample = max(1, int(self.declare_parameter("boundary_downsample", 2).value))
+        self._stage_times: dict = {}
+        self._stage_t = None
         self._text_cache: dict = {}
         self._prompt_stats: dict = {}
         self._frames_total = 0
@@ -317,8 +327,10 @@ class Segmentation(rclpy.node.Node):
             if item is None:
                 break
             msg, header = item
+            self._stage_t = time.perf_counter() if self.profile_stages else None
             try:
                 image = self._decode(msg)
+                self._mark("decode")
             except Exception as e:
                 self.get_logger().error(f"Image decode failed: {type(e).__name__}: {e}")
                 continue
@@ -620,7 +632,8 @@ class Segmentation(rclpy.node.Node):
                                  ("obstacle_prompt", "obstacle_prompt", str),
                                  ("obstacle_dilate_px", "obstacle_dilate_px", int),
                                  ("prompt_stats_period", "prompt_stats_period", int),
-                                 ("batch_prompts", "batch_prompts", bool)):
+                                 ("batch_prompts", "batch_prompts", bool),
+                                 ("profile_stages", "profile_stages", bool)):
             value = cast(self.get_parameter(name).value)
             if value != getattr(self, attr):
                 setattr(self, attr, value)
@@ -637,6 +650,29 @@ class Segmentation(rclpy.node.Node):
         self.get_logger().info("Prompt stats: " + " | ".join(parts))
         self._prompt_stats = {}
         self._frames_total = self._frames_with_road = 0
+
+    def _mark(self, stage: str) -> None:
+        """Close the current timing stage (profile_stages only)."""
+        if not self.profile_stages:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        if self._stage_t is not None and stage:
+            self._stage_times.setdefault(stage, []).append(1e3 * (now - self._stage_t))
+        self._stage_t = now
+
+    def _log_stage_times(self) -> None:
+        if not self.profile_stages or not self._stage_times:
+            return
+        n = len(next(iter(self._stage_times.values())))
+        if n < max(1, self.prompt_stats_period):
+            return
+        parts = [f"{k} {numpy.median(v):.1f}" for k, v in self._stage_times.items()]
+        total = sum(numpy.median(v) for v in self._stage_times.values())
+        self.get_logger().info(f"Stage times (median ms over {n}): " + " | ".join(parts)
+                               + f" | sum {total:.0f}")
+        self._stage_times = {}
 
     def _run_inference(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
         self.inference_count += 1
@@ -657,6 +693,7 @@ class Segmentation(rclpy.node.Node):
             new_h = int(orig_h * scale)
             image = cv2.resize(image, (new_w, new_h))
         infer_h, infer_w = image.shape[:2]
+        self._mark("resize")
 
         try:
             t0 = time.time()
@@ -677,6 +714,7 @@ class Segmentation(rclpy.node.Node):
                 f"[Inference {inference_id}] set_image() done in {time.time() - t1:.3f}s"
             )
 
+            self._mark("set_image")
             road_terms = self._or_terms(self.text_prompt) if self.batch_prompts else None
             obs_terms = (self._or_terms(self.obstacle_prompt)
                          if self.obstacle_prompt.strip() else [])
@@ -693,6 +731,7 @@ class Segmentation(rclpy.node.Node):
                 )
                 obs_masks = None
 
+            self._mark("prompts")
             self._frames_total += 1
             self._frames_with_road += int(masks.shape[0] > 0)
             obstacle_mask = None
@@ -710,6 +749,7 @@ class Segmentation(rclpy.node.Node):
                     obstacle_mask.astype(numpy.uint8) * 255, dst_format="png")
                 obstacle_msg.header = header
                 self.obstacle_mask_pub.publish(obstacle_msg)
+            self._mark("obstacle_mask_pub")
 
             self.get_logger().debug(
                 f"[Inference {inference_id}] Output: "
@@ -753,9 +793,13 @@ class Segmentation(rclpy.node.Node):
             mask_image_msg.header = header
             self.mask_image_pub.publish(mask_image_msg)
             self.get_logger().debug(f"[Inference {inference_id}] Published mask_image/compressed")
+            self._mark("mask_image_pub")
 
+            # The raw full-size result image is built and published only when someone listens;
+            # the compressed visualisation timer below still runs at its own rate.
+            publish_result = self.result_image_pub.get_subscription_count() > 0
             annotated = image.copy()
-            if masks.shape[0] > 0:
+            if publish_result and masks.shape[0] > 0:
                 colored_masks = (
                     masks.to(torch.uint8).unsqueeze(1)
                     * self.colors[
@@ -764,10 +808,12 @@ class Segmentation(rclpy.node.Node):
                 ).amax(dim=0).to(torch.uint8)
                 overlay = colored_masks.permute(1, 2, 0).cpu().numpy()
                 annotated = cv2.addWeighted(image, 1.0, overlay, 0.5, 0.0)
-            result_image_msg = self.cv_bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-            result_image_msg.header = header
-            self.result_image_pub.publish(result_image_msg)
+            if publish_result:
+                result_image_msg = self.cv_bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+                result_image_msg.header = header
+                self.result_image_pub.publish(result_image_msg)
             self.get_logger().debug(f"[Inference {inference_id}] Published result_image")
+            self._mark("result_image_pub")
 
             detections = vision_msgs.msg.Detection2DArray()
             detections.header = header
@@ -801,6 +847,7 @@ class Segmentation(rclpy.node.Node):
                 detections.detections.append(detection)
 
             self.detections_pub.publish(detections)
+            self._mark("detections_pub")
             self.get_logger().debug(
                 f"[Inference {inference_id}] Published detections, count={len(detections.detections)}"
             )
@@ -808,7 +855,9 @@ class Segmentation(rclpy.node.Node):
             self._extract_and_publish_boundaries(
                 masks, header, orig_h, orig_w, infer_h, infer_w, obstacle_mask=obstacle_mask
             )
+            self._mark("boundaries")
             self._log_prompt_stats()
+            self._log_stage_times()
 
             self.get_logger().info(
                 f"[Inference {inference_id}] Finished in {time.time() - total_start:.3f}s, "
@@ -935,19 +984,27 @@ class Segmentation(rclpy.node.Node):
 
     def _publish_rowwise_boundaries(self, masks, header, orig_h, orig_w, infer_h, infer_w,
                                     obstacle_mask, min_area) -> None:
-        road = masks.any(dim=0).cpu().numpy().astype(numpy.uint8)
+        f = self.boundary_downsample
+        # Downsample on the GPU by striding before the copy, so less crosses to the CPU too.
+        road = masks.any(dim=0)[::f, ::f].cpu().numpy().astype(numpy.uint8)
+        obstacle = obstacle_mask[::f, ::f] if obstacle_mask is not None else None
         # The seam closing still applies: a surface-colour change can split the road mask, and
         # the ego component would then keep only the near half.
-        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, self._boundary_close_kernel).astype(bool)
-        comp = ego_component(road, bridge_mask=obstacle_mask)
-        if comp.sum() < min_area:
+        kernel = (self._boundary_close_kernel if f == 1
+                  else self._build_close_kernel(max(1, self.boundary_close_kernel_size // f)))
+        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel).astype(bool)
+        comp = ego_component(road, bridge_mask=obstacle)
+        if comp.sum() * f * f < min_area:
             self.get_logger().warn(
-                f"Boundary drop: ego road component is {int(comp.sum())}px, below "
+                f"Boundary drop: ego road component is {int(comp.sum()) * f * f}px, below "
                 f"{min_area:.0f}."
             )
             return
-        left, right = rowwise_boundary(comp, obstacle_mask=obstacle_mask,
-                                       obstacle_dilate_px=self.obstacle_dilate_px)
+        left, right = rowwise_boundary(comp, obstacle_mask=obstacle, row_step=max(1, 2 // f),
+                                       obstacle_dilate_px=max(1, self.obstacle_dilate_px // f))
+        # Back to inference pixels (centre of each downsampled cell), then to the original image.
+        left = left * f + (f - 1) / 2.0
+        right = right * f + (f - 1) / 2.0
         scale = numpy.array([orig_w / infer_w, orig_h / infer_h], dtype=numpy.float32)
         for pts, pub in ((left, self.left_contour_pub), (right, self.right_contour_pub)):
             if pts.shape[0] == 0:
