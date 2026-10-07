@@ -20,6 +20,8 @@ import torch
 import vision_msgs.msg
 from sam2_msgs.msg import DetectedRoadArea
 
+from sam3_ros.road_mask_boundary import ego_component, rowwise_boundary
+
 
 class Segmentation(rclpy.node.Node):
     class Result:
@@ -87,6 +89,26 @@ class Segmentation(rclpy.node.Node):
             .integer_value
         )
         self._boundary_close_kernel = self._build_close_kernel(self.boundary_close_kernel_size)
+        # How the road mask becomes left/right contours. "rowwise": the outermost pixels of the
+        # hole-filled road component the vehicle is on, without the horizon rows or image-border
+        # pixels (road_mask_boundary.rowwise_boundary). "legacy": the largest external contour
+        # split at each row band's mean x, which hands a car's outline to the boundary and drops
+        # road beyond a car that cuts the mask in two. Settable at runtime.
+        self.boundary_mode = str(self.declare_parameter("boundary_mode", "rowwise").value)
+        # Obstacles prompted on the SAME image encoding: set_image is the expensive call, a text
+        # prompt on its state is cheap. Their mask bridges road components (far road beyond a
+        # vehicle stays connected) and drops boundary pixels next to a vehicle, where the road
+        # ends at the vehicle rather than at its edge. Published on ~/obstacle_mask/compressed.
+        # Empty string disables it. Settable at runtime.
+        self.obstacle_prompt = str(
+            self.declare_parameter("obstacle_prompt", "car or truck or person").value)
+        self.obstacle_dilate_px = int(self.declare_parameter("obstacle_dilate_px", 6).value)
+        # Log, every N inferences, how often each prompt term returns a mask and with what
+        # score -- "No masks detected" says nothing about WHICH term failed. 0 disables.
+        self.prompt_stats_period = int(self.declare_parameter("prompt_stats_period", 50).value)
+        self._prompt_stats: dict = {}
+        self._frames_total = 0
+        self._frames_with_road = 0
         # The debayered /camera_fl/image_color arrives ~0.5s behind its own capture
         # stamp because image_proc runs a permanent backlog, and every millisecond of
         # that lands in the contour-to-LiDAR skew downstream. The raw Bayer topic is
@@ -119,6 +141,7 @@ class Segmentation(rclpy.node.Node):
             f"text_prompt='{self.text_prompt}', "
             f"confidence_threshold={self.confidence_threshold}, "
             f"boundary_close_kernel_size={self.boundary_close_kernel_size}, "
+            f"boundary_mode={self.boundary_mode}, obstacle_prompt='{self.obstacle_prompt}', "
             f"result_visualization_rate={result_visualization_rate}, "
             f"use_amp={self.amp_enabled}"
         )
@@ -168,6 +191,9 @@ class Segmentation(rclpy.node.Node):
 
         self.mask_image_pub = self.create_publisher(
             sensor_msgs.msg.CompressedImage, "~/mask_image/compressed", 1
+        )
+        self.obstacle_mask_pub = self.create_publisher(
+            sensor_msgs.msg.CompressedImage, "~/obstacle_mask/compressed", 1
         )
         self.result_image_pub = self.create_publisher(sensor_msgs.msg.Image, "~/result_image", 1)
         self.detections_pub = self.create_publisher(
@@ -374,6 +400,12 @@ class Segmentation(rclpy.node.Node):
         if scores.numel() == 0:
             scores = scores.reshape(0)
 
+        st = self._prompt_stats.setdefault(prompt, [0, 0, 0.0, 0.0])
+        st[0] += 1
+        st[1] += int(masks.shape[0] > 0)
+        st[2] += float(scores.max().item()) if scores.numel() > 0 else 0.0
+        st[3] += time.time() - t_start
+
         suffix = f" [{label}]" if label else ""
         self.get_logger().debug(
             f"[Inference {inference_id}] set_text_prompt('{prompt}'){suffix} done in {time.time() - t_start:.3f}s"
@@ -386,15 +418,16 @@ class Segmentation(rclpy.node.Node):
         inference_state,
         image_shape: tuple[int, int],
         inference_id: int,
+        expression: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        expression = self.text_prompt.strip()
+        expression = (self.text_prompt if expression is None else expression).strip()
         lower = expression.lower()
 
         # Cache parse result so regex runs only when prompt changes
         if expression not in self._cached_prompt_parse:
             has_or = bool(re.search(r"\s(?:or|\|)\s", lower))
             has_and = bool(re.search(r"\s(?:and|&)\s", lower))
-            self._cached_prompt_parse = {expression: (has_or, has_and)}
+            self._cached_prompt_parse[expression] = (has_or, has_and)
         has_or, has_and = self._cached_prompt_parse[expression]
 
         if has_or and has_and:
@@ -511,6 +544,28 @@ class Segmentation(rclpy.node.Node):
                 f"{self.boundary_close_kernel_size}"
             )
 
+    def _refresh_boundary_parameters(self, inference_id: int) -> None:
+        for name, attr, cast in (("boundary_mode", "boundary_mode", str),
+                                 ("obstacle_prompt", "obstacle_prompt", str),
+                                 ("obstacle_dilate_px", "obstacle_dilate_px", int),
+                                 ("prompt_stats_period", "prompt_stats_period", int)):
+            value = cast(self.get_parameter(name).value)
+            if value != getattr(self, attr):
+                setattr(self, attr, value)
+                self.get_logger().info(f"[Inference {inference_id}] {name} updated to '{value}'")
+
+    def _log_prompt_stats(self) -> None:
+        if self.prompt_stats_period <= 0 or self._frames_total < self.prompt_stats_period:
+            return
+        parts = [f"frames with a road mask {self._frames_with_road}/{self._frames_total} "
+                 f"({100.0 * self._frames_with_road / self._frames_total:.0f}%)"]
+        for term, (n, hits, score_sum, secs) in self._prompt_stats.items():
+            parts.append(f"'{term}': masks in {100.0 * hits / max(n, 1):.0f}% of {n}, "
+                         f"mean max score {score_sum / max(n, 1):.2f}, {1e3 * secs / max(n, 1):.0f} ms")
+        self.get_logger().info("Prompt stats: " + " | ".join(parts))
+        self._prompt_stats = {}
+        self._frames_total = self._frames_with_road = 0
+
     def _run_inference(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
         self.inference_count += 1
         inference_id = self.inference_count
@@ -518,6 +573,7 @@ class Segmentation(rclpy.node.Node):
         header = self._sanitize_header(header)
 
         self._refresh_tunable_parameters(inference_id)
+        self._refresh_boundary_parameters(inference_id)
 
         self.get_logger().debug(f"[Inference {inference_id}] Starting inference")
 
@@ -555,6 +611,23 @@ class Segmentation(rclpy.node.Node):
                 inference_id=inference_id,
             )
 
+            self._frames_total += 1
+            self._frames_with_road += int(masks.shape[0] > 0)
+            obstacle_mask = None
+            if self.obstacle_prompt.strip():
+                obs_masks, _, _ = self._run_prompt_expression(
+                    inference_state=inference_state,
+                    image_shape=image.shape[:2],
+                    inference_id=inference_id,
+                    expression=self.obstacle_prompt,
+                )
+                obstacle_mask = (obs_masks.any(dim=0).cpu().numpy() if obs_masks.shape[0] > 0
+                                 else numpy.zeros(image.shape[:2], dtype=bool))
+                obstacle_msg = self.cv_bridge.cv2_to_compressed_imgmsg(
+                    obstacle_mask.astype(numpy.uint8) * 255, dst_format="png")
+                obstacle_msg.header = header
+                self.obstacle_mask_pub.publish(obstacle_msg)
+
             self.get_logger().debug(
                 f"[Inference {inference_id}] Output: "
                 f"masks_shape={tuple(masks.shape)}, "
@@ -591,7 +664,9 @@ class Segmentation(rclpy.node.Node):
                 mask_ids = torch.zeros(image.shape[:2], dtype=torch.uint8, device=self.device)
 
             mask_image_np = mask_ids.clamp(0, 255).to(torch.uint8).cpu().numpy()
-            mask_image_msg = self.cv_bridge.cv2_to_compressed_imgmsg(mask_image_np)
+            # PNG, not cv_bridge's default JPEG: the values are mask ids, and JPEG rings them
+            # around the outline every consumer then has to clean up.
+            mask_image_msg = self.cv_bridge.cv2_to_compressed_imgmsg(mask_image_np, dst_format="png")
             mask_image_msg.header = header
             self.mask_image_pub.publish(mask_image_msg)
             self.get_logger().debug(f"[Inference {inference_id}] Published mask_image/compressed")
@@ -647,7 +722,10 @@ class Segmentation(rclpy.node.Node):
                 f"[Inference {inference_id}] Published detections, count={len(detections.detections)}"
             )
 
-            self._extract_and_publish_boundaries(masks, header, orig_h, orig_w, infer_h, infer_w)
+            self._extract_and_publish_boundaries(
+                masks, header, orig_h, orig_w, infer_h, infer_w, obstacle_mask=obstacle_mask
+            )
+            self._log_prompt_stats()
 
             self.get_logger().info(
                 f"[Inference {inference_id}] Finished in {time.time() - total_start:.3f}s, "
@@ -691,10 +769,17 @@ class Segmentation(rclpy.node.Node):
         orig_w: int,
         infer_h: int,
         infer_w: int,
+        obstacle_mask: numpy.ndarray | None = None,
     ) -> None:
         MIN_CONTOUR_AREA = 1000.0
         try:
             if masks.shape[0] == 0:
+                return
+            if self.boundary_mode != "legacy":
+                self._publish_rowwise_boundaries(
+                    masks, header, orig_h, orig_w, infer_h, infer_w, obstacle_mask,
+                    MIN_CONTOUR_AREA,
+                )
                 return
 
             # Use the union of all masks as the road mask
@@ -764,6 +849,30 @@ class Segmentation(rclpy.node.Node):
             self.get_logger().error(
                 f"Exception in _extract_and_publish_boundaries: {type(e).__name__}: {e}"
             )
+
+    def _publish_rowwise_boundaries(self, masks, header, orig_h, orig_w, infer_h, infer_w,
+                                    obstacle_mask, min_area) -> None:
+        road = masks.any(dim=0).cpu().numpy().astype(numpy.uint8)
+        # The seam closing still applies: a surface-colour change can split the road mask, and
+        # the ego component would then keep only the near half.
+        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, self._boundary_close_kernel).astype(bool)
+        comp = ego_component(road, bridge_mask=obstacle_mask)
+        if comp.sum() < min_area:
+            self.get_logger().warn(
+                f"Boundary drop: ego road component is {int(comp.sum())}px, below "
+                f"{min_area:.0f}."
+            )
+            return
+        left, right = rowwise_boundary(comp, obstacle_mask=obstacle_mask,
+                                       obstacle_dilate_px=self.obstacle_dilate_px)
+        scale = numpy.array([orig_w / infer_w, orig_h / infer_h], dtype=numpy.float32)
+        for pts, pub in ((left, self.left_contour_pub), (right, self.right_contour_pub)):
+            if pts.shape[0] == 0:
+                continue
+            msg = DetectedRoadArea()
+            msg.header = header
+            msg.road_area.data = (pts * scale).flatten().tolist()
+            pub.publish(msg)
 
     def _visualize_result(self) -> None:
         try:

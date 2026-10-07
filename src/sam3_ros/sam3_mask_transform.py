@@ -41,11 +41,12 @@ what the shared module exists to prevent.
 import os
 
 from ament_index_python.packages import get_package_share_directory
+import cv2
 import numpy as np
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 import yaml
 
@@ -56,6 +57,9 @@ from perception_common.stamp_sync import (
     apply_bounded_parameters,
 )
 from sam2_msgs.msg import DetectedRoadArea
+from perception_common.lane_geometry import DEFAULT_EGO_YAW_DEG
+
+from sam3_ros.road_mask_boundary import ego_component, lift_mask_boundary
 
 TOPICS_PATH = os.path.join(
     get_package_share_directory("perception_common"), "topics.yaml"
@@ -67,6 +71,7 @@ with open(TOPICS_PATH, "r") as f:
 _topics = _config.get("topics", {})
 _sam_topics = _topics.get("sam3") or {}
 _transform_topics = _topics.get("transform") or {}
+_raw_topics = _topics.get("raw") or {}
 
 LIDAR_2D_PROJ_TOPIC = _transform_topics.get("lidar_2d_projection", "/lidar_2d_projection")
 SAM3_LEFT_CONTOUR_TOPIC = _sam_topics.get("left_contour", "/sam3_left_contour")
@@ -175,6 +180,25 @@ class Sam3MaskTransform(Node):
             .double_value
         )
 
+        # "mask": lift the WHOLE road mask (every projected return whose pixel is road and that
+        # sits on the ground) and take per-bin lateral extremes in the vehicle frame
+        # (road_mask_boundary.lift_mask_boundary). "contour": match contour pixels to returns
+        # within PIXEL_LIM pixels, which near an edge also catches returns behind it.
+        # Settable at runtime; "contour" is the previous behaviour.
+        self._lift_mode = str(self.declare_parameter("lift_mode", "mask").value)
+        mask_topic = str(self.declare_parameter(
+            "mask_topic", "/segmentation/mask_image/compressed").value)
+        obstacle_mask_topic = str(self.declare_parameter(
+            "obstacle_mask_topic", "/segmentation/obstacle_mask/compressed").value)
+        camera_info_topic = str(self.declare_parameter(
+            "camera_info_topic", _raw_topics.get("camera_info", "/camera_fl/camera_info")).value)
+        self._ego_yaw_deg = float(self.declare_parameter("ego_yaw_deg", DEFAULT_EGO_YAW_DEG).value)
+        self._lift_x_min = float(self.declare_parameter("lift_x_min", 5.0).value)
+        self._lift_x_max = float(self.declare_parameter("lift_x_max", 60.0).value)
+        self._lift_bin_len = float(self.declare_parameter("lift_bin_len", 2.0).value)
+        self._image_wh = None
+        self._obstacle_masks = {}   # capture stamp (ns) -> decoded obstacle mask
+
         self._boundary_timeout = max(0.0, boundary_timeout)
         self._projections = StampMatchedBuffer(
             "projection",
@@ -216,6 +240,10 @@ class Sam3MaskTransform(Node):
             qos_depth,
         )
         self.create_subscription(PointCloud2, lidar_topic, self._on_projection, qos_depth)
+        self.create_subscription(CompressedImage, mask_topic, self._on_mask, qos_depth)
+        self.create_subscription(CompressedImage, obstacle_mask_topic, self._on_obstacle_mask,
+                                 qos_depth)
+        self.create_subscription(CameraInfo, camera_info_topic, self._on_camera_info, 1)
 
         # Fixed period, so boundary_timeout is enforced to within 0.5s of granularity.
         self._watchdog_timer = self.create_timer(0.5, self._watchdog)
@@ -236,6 +264,7 @@ class Sam3MaskTransform(Node):
             f"wait_for_newer={self._projections.wait_for_newer:.3f}s "
             f"boundary_timeout={self._boundary_timeout:.3f}s qos_depth={qos_depth} "
             f"use_sim_time={self.get_parameter('use_sim_time').value} "
+            f"lift_mode={self._lift_mode} (mask: {mask_topic}) "
             f"(stamp-matched pairing)"
         )
 
@@ -250,6 +279,14 @@ class Sam3MaskTransform(Node):
             "boundary_timeout": (self, "_boundary_timeout"),
             "wait_for_newer": (self._projections, "wait_for_newer"),
         }
+        for prm in params:
+            if prm.name == "lift_mode":
+                if str(prm.value) not in ("mask", "contour"):
+                    return SetParametersResult(successful=False,
+                                               reason="lift_mode must be 'mask' or 'contour'")
+                self._lift_mode = str(prm.value)
+                self.get_logger().info(f"lift_mode set to {self._lift_mode}")
+        params = [prm for prm in params if prm.name != "lift_mode"]
         ok, reason, applied = apply_bounded_parameters(params, targets)
         if not ok:
             return SetParametersResult(successful=False, reason=reason)
@@ -264,7 +301,56 @@ class Sam3MaskTransform(Node):
         # lands; the pump timer only matters when this stream stalls.
         self._pump()
 
+    def _on_camera_info(self, msg: CameraInfo) -> None:
+        if msg.width > 0 and msg.height > 0:
+            self._image_wh = (int(msg.width), int(msg.height))
+
+    @staticmethod
+    def _stamp_ns(header) -> int:
+        return header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
+
+    def _on_obstacle_mask(self, msg: CompressedImage) -> None:
+        img = cv2.imdecode(np.frombuffer(bytes(msg.data), np.uint8), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return
+        self._obstacle_masks[self._stamp_ns(msg.header)] = img > 127
+        while len(self._obstacle_masks) > 8:
+            self._obstacle_masks.pop(next(iter(self._obstacle_masks)))
+
+    def _on_mask(self, msg: CompressedImage) -> None:
+        if self._lift_mode != "mask":
+            return
+        pairing = self._projections.match(msg.header, now=self._now(), payload=msg, key="mask")
+        if pairing.outcome is not DEFERRED:
+            self._complete(pairing)
+
+    def _publish_lifted(self, msg: CompressedImage, entry) -> None:
+        if self._image_wh is None:
+            self.get_logger().warning("No camera_info yet; cannot scale the mask to pixels.",
+                                      throttle_duration_sec=5.0)
+            return
+        mask = cv2.imdecode(np.frombuffer(bytes(msg.data), np.uint8), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return
+        road = mask >= 1
+        obstacle = self._obstacle_masks.get(self._stamp_ns(msg.header))
+        if obstacle is not None and obstacle.shape != road.shape:
+            obstacle = None
+        road = ego_component(road, bridge_mask=obstacle)
+        xyz, u, v = entry.arrays()
+        left, right = lift_mask_boundary(
+            xyz, u, v, road, self._image_wh, obstacle_px=obstacle,
+            ego_yaw_deg=self._ego_yaw_deg, x_min=self._lift_x_min, x_max=self._lift_x_max,
+            bin_len=self._lift_bin_len)
+        # Published even when empty, as the contour path does.
+        now = self._now()
+        for side, pts in (("left", left), ("right", right)):
+            self.create_cloud(pts, self.publishers_by_side[side], entry.header)
+            self._last_publish[side] = now
+
     def _on_contour(self, msg: DetectedRoadArea, side: str) -> None:
+        if self._lift_mode == "mask":
+            return
         # key=side keeps the two sides' pending queues independent, so a silent side never
         # blocks the other, while both still match against one shared cloud buffer.
         pairing = self._projections.match(
@@ -280,6 +366,9 @@ class Sam3MaskTransform(Node):
     def _complete(self, pairing) -> None:
         if pairing.value is None:
             self._log_unmatched(pairing.key, pairing.skew, pairing.reason)
+            return
+        if pairing.key == "mask":
+            self._publish_lifted(pairing.payload, pairing.value)
             return
         self._publish_boundary(pairing.payload, pairing.value, pairing.key)
 
