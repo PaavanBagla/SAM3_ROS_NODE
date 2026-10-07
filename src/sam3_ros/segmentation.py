@@ -1,3 +1,4 @@
+import os
 import queue
 import threading
 import time
@@ -125,6 +126,30 @@ class Segmentation(rclpy.node.Node):
         self._stage_times: dict = {}
         self._stage_t = None
         self._text_cache: dict = {}
+        # Replay the batched grounding pass as recorded CUDA graphs (torch.compile,
+        # mode="reduce-overhead"). The pass is many small, launch-bound kernels; replaying them
+        # as one graph removes the per-kernel launch cost. Measured on GPU 1, idle machine:
+        # grounding 56 -> 37 ms, batched total 123 -> 104 ms, masks identical (IoU >= 0.998).
+        # COST: ~70 s of compiling and recording on the first two frames, and again whenever the
+        # number of prompt terms changes. Off by default; only the batched path uses it.
+        self.cuda_graphs = bool(self.declare_parameter("cuda_graphs", False).value)
+        self._ground_compiled = None
+        # Persist compiled kernels across restarts: with a warm cache the first two frames take
+        # ~16 s instead of ~74 s (idle machine). The default sits in the Hugging Face cache, which
+        # the compose file already mounts from the host. Compiler worker threads are capped so the
+        # one-off compile does not take every core while the rest of the vehicle software runs.
+        cache_dir = str(self.declare_parameter(
+            "compile_cache_dir", "/root/.cache/huggingface/torchinductor_sam3").value)
+        compile_threads = int(self.declare_parameter("compile_threads", 4).value)
+        if cache_dir:
+            # Assigned, not setdefault: importing sam3 already makes torch fill in a default under
+            # /tmp, which lives inside the container and is lost on every restart. Triton keeps a
+            # second cache of its own (~/.triton, also inside the container).
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+            os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
+            os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+            os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
+        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", str(max(1, compile_threads)))
         self._prompt_stats: dict = {}
         self._frames_total = 0
         self._frames_with_road = 0
@@ -435,6 +460,23 @@ class Segmentation(rclpy.node.Node):
 
         return masks, boxes, scores
 
+    def _grounding_fn(self):
+        """forward_grounding, eager or compiled for CUDA-graph replay (cuda_graphs)."""
+        if not (self.cuda_graphs and self.device.type == "cuda"):
+            return self.model.forward_grounding
+        if self._ground_compiled is None:
+            # The box encoder pins a host tensor, which cannot be traced; it runs eager (it only
+            # sees the empty dummy box prompt here), and the rest is captured around it.
+            enc = self.model.geometry_encoder
+            enc._encode_boxes = torch.compiler.disable(enc._encode_boxes)
+            self._ground_compiled = torch.compile(self.model.forward_grounding,
+                                                  mode="reduce-overhead", dynamic=False)
+            self.get_logger().info(
+                "cuda_graphs: compiling the batched grounding pass; the first two frames take "
+                "~70 s idle, ~3 min under load, or ~16 s idle with a warm compile cache "
+                f"({os.environ.get('TORCHINDUCTOR_CACHE_DIR')})")
+        return self._ground_compiled
+
     @staticmethod
     def _or_terms(expression: str):
         """The OR terms of a prompt expression, or None when it is an AND/mixed expression."""
@@ -459,7 +501,7 @@ class Segmentation(rclpy.node.Node):
                              text_ids=torch.arange(k, device=self.device, dtype=torch.long),
                              input_boxes=None, input_boxes_mask=None, input_boxes_label=None,
                              input_points=None, input_points_mask=None)
-            out = self.model.forward_grounding(
+            out = self._grounding_fn()(
                 backbone_out=inference_state["backbone_out"], find_input=find,
                 geometric_prompt=self.model._get_dummy_prompt(num_prompts=k), find_target=None)
             probs = (out["pred_logits"].sigmoid()
@@ -633,7 +675,8 @@ class Segmentation(rclpy.node.Node):
                                  ("obstacle_dilate_px", "obstacle_dilate_px", int),
                                  ("prompt_stats_period", "prompt_stats_period", int),
                                  ("batch_prompts", "batch_prompts", bool),
-                                 ("profile_stages", "profile_stages", bool)):
+                                 ("profile_stages", "profile_stages", bool),
+                                 ("cuda_graphs", "cuda_graphs", bool)):
             value = cast(self.get_parameter(name).value)
             if value != getattr(self, attr):
                 setattr(self, attr, value)
