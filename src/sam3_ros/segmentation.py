@@ -14,6 +14,8 @@ import rclpy.node
 import rclpy.qos
 import sam3
 import sam3.model.sam3_image_processor
+from sam3.model import box_ops
+from sam3.model.data_misc import FindStage
 import sensor_msgs.msg
 import std_msgs.msg
 import torch
@@ -106,6 +108,13 @@ class Segmentation(rclpy.node.Node):
         # Log, every N inferences, how often each prompt term returns a mask and with what
         # score -- "No masks detected" says nothing about WHICH term failed. 0 disables.
         self.prompt_stats_period = int(self.declare_parameter("prompt_stats_period", 50).value)
+        # Run every OR term of the road AND obstacle prompts as ONE batched grounding pass over the
+        # shared image features, with the text encodings cached (they never change between frames).
+        # Masks are identical to the per-term path (IoU 1.000 on Route2 frames); measured on GPU 1:
+        # 177 -> 123 ms for four terms on an idle machine, 269 -> 143 ms with the full stack running,
+        # because the per-term path is many small, launch-bound kernels. false restores per-term.
+        self.batch_prompts = bool(self.declare_parameter("batch_prompts", True).value)
+        self._text_cache: dict = {}
         self._prompt_stats: dict = {}
         self._frames_total = 0
         self._frames_with_road = 0
@@ -264,7 +273,7 @@ class Segmentation(rclpy.node.Node):
 
         return numpy.ascontiguousarray(image)
 
-    def _enqueue_latest(self, image: numpy.ndarray, header: std_msgs.msg.Header) -> None:
+    def _enqueue_latest(self, image, header: std_msgs.msg.Header) -> None:
         """Queue a frame for inference, discarding any frame it supersedes.
 
         Dropping the *incoming* frame instead would leave inference to start on the
@@ -282,36 +291,37 @@ class Segmentation(rclpy.node.Node):
                 except queue.Empty:
                     pass
 
+    # The callbacks only queue the MESSAGE; the worker converts the one frame it runs on.
+    # Converting every frame here (10 Hz, 9.5 MB each) cost GIL time the inference thread needs to
+    # launch kernels, for frames of which ~80% were then superseded unused.
     def _image_compressed_callback(self, msg: sensor_msgs.msg.CompressedImage) -> None:
         self.received_frame_count += 1
-        try:
-            image = self.cv_bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            image = self._normalize_input_image(image)
-            self._enqueue_latest(image, msg.header)
-        except Exception as e:
-            self.get_logger().error(
-                f"Exception in _image_compressed_callback: {type(e).__name__}: {e}"
-            )
-            self.get_logger().error(traceback.format_exc())
+        self._enqueue_latest(msg, msg.header)
 
     def _image_callback(self, msg: sensor_msgs.msg.Image) -> None:
         self.received_frame_count += 1
-        try:
+        self._enqueue_latest(msg, msg.header)
+
+    def _decode(self, msg) -> numpy.ndarray:
+        if isinstance(msg, sensor_msgs.msg.CompressedImage):
+            image = self.cv_bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        else:
             # desired_encoding="bgr8" makes cv_bridge debayer bayer_rggb8 input,
             # matching what image_proc would have produced.
             image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            image = self._normalize_input_image(image)
-            self._enqueue_latest(image, msg.header)
-        except Exception as e:
-            self.get_logger().error(f"Exception in _image_callback: {type(e).__name__}: {e}")
-            self.get_logger().error(traceback.format_exc())
+        return self._normalize_input_image(image)
 
     def _inference_worker(self) -> None:
         while True:
             item = self._infer_queue.get()
             if item is None:
                 break
-            image, header = item
+            msg, header = item
+            try:
+                image = self._decode(msg)
+            except Exception as e:
+                self.get_logger().error(f"Image decode failed: {type(e).__name__}: {e}")
+                continue
             self._run_inference(image, header)
 
     def _sanitize_header(self, header: std_msgs.msg.Header) -> std_msgs.msg.Header:
@@ -412,6 +422,67 @@ class Segmentation(rclpy.node.Node):
         )
 
         return masks, boxes, scores
+
+    @staticmethod
+    def _or_terms(expression: str):
+        """The OR terms of a prompt expression, or None when it is an AND/mixed expression."""
+        lower = expression.strip().lower()
+        if re.search(r"\s(?:and|&)\s", lower):
+            return None
+        return [t.strip() for t in re.split(r"\s*(?:\bor\b|\|)\s*", expression.strip()) if t.strip()]
+
+    def _run_terms_batched(self, terms, inference_state, image_shape, inference_id):
+        """All ``terms`` as one batched grounding pass. Returns per-term (masks, boxes, scores)."""
+        key = tuple(terms)
+        k = len(terms)
+        t_start = time.time()
+        with torch.inference_mode(), torch.autocast(
+                "cuda", enabled=self.amp_enabled and self.device.type == "cuda", dtype=torch.float16):
+            if key not in self._text_cache:
+                if len(self._text_cache) > 8:
+                    self._text_cache.clear()
+                self._text_cache[key] = self.model.backbone.forward_text(list(terms), device=self.device)
+            inference_state["backbone_out"].update(self._text_cache[key])
+            find = FindStage(img_ids=torch.zeros(k, device=self.device, dtype=torch.long),
+                             text_ids=torch.arange(k, device=self.device, dtype=torch.long),
+                             input_boxes=None, input_boxes_mask=None, input_boxes_label=None,
+                             input_points=None, input_points_mask=None)
+            out = self.model.forward_grounding(
+                backbone_out=inference_state["backbone_out"], find_input=find,
+                geometric_prompt=self.model._get_dummy_prompt(num_prompts=k), find_target=None)
+            probs = (out["pred_logits"].sigmoid()
+                     * out["presence_logit_dec"].sigmoid().unsqueeze(1)).squeeze(-1)
+            h, w = inference_state["original_height"], inference_state["original_width"]
+            scale = torch.tensor([w, h, w, h], device=self.device, dtype=torch.float32)
+            results = []
+            for i, term in enumerate(terms):
+                keep = probs[i] > self.confidence_threshold
+                masks = out["pred_masks"][i][keep]
+                if masks.shape[0]:
+                    masks = torch.nn.functional.interpolate(
+                        masks.unsqueeze(1).float(), (h, w), mode="bilinear",
+                        align_corners=False).sigmoid() > 0.5
+                masks = self._normalize_masks(masks, image_shape)
+                boxes = box_ops.box_cxcywh_to_xyxy(out["pred_boxes"][i][keep]).float() * scale
+                scores = probs[i][keep].float()
+                st = self._prompt_stats.setdefault(term, [0, 0, 0.0, 0.0])
+                st[0] += 1
+                st[1] += int(masks.shape[0] > 0)
+                st[2] += float(scores.max().item()) if scores.numel() else 0.0
+                results.append((masks, boxes.reshape(-1, 4), scores))
+        dt = time.time() - t_start
+        for term in terms:
+            self._prompt_stats[term][3] += dt / k
+        self.get_logger().debug(
+            f"[Inference {inference_id}] batched {k} terms {list(terms)} done in {dt:.3f}s")
+        return results
+
+    def _concat(self, parts, image_shape):
+        parts = [p for p in parts if p[0].shape[0] > 0]
+        if not parts:
+            return self._empty_outputs(image_shape)
+        return (torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts]),
+                torch.cat([p[2] for p in parts]))
 
     def _run_prompt_expression(
         self,
@@ -548,7 +619,8 @@ class Segmentation(rclpy.node.Node):
         for name, attr, cast in (("boundary_mode", "boundary_mode", str),
                                  ("obstacle_prompt", "obstacle_prompt", str),
                                  ("obstacle_dilate_px", "obstacle_dilate_px", int),
-                                 ("prompt_stats_period", "prompt_stats_period", int)):
+                                 ("prompt_stats_period", "prompt_stats_period", int),
+                                 ("batch_prompts", "batch_prompts", bool)):
             value = cast(self.get_parameter(name).value)
             if value != getattr(self, attr):
                 setattr(self, attr, value)
@@ -605,22 +677,33 @@ class Segmentation(rclpy.node.Node):
                 f"[Inference {inference_id}] set_image() done in {time.time() - t1:.3f}s"
             )
 
-            masks, boxes, scores = self._run_prompt_expression(
-                inference_state=inference_state,
-                image_shape=image.shape[:2],
-                inference_id=inference_id,
-            )
+            road_terms = self._or_terms(self.text_prompt) if self.batch_prompts else None
+            obs_terms = (self._or_terms(self.obstacle_prompt)
+                         if self.obstacle_prompt.strip() else [])
+            if road_terms and obs_terms is not None:
+                parts = self._run_terms_batched(road_terms + obs_terms, inference_state,
+                                                image.shape[:2], inference_id)
+                masks, boxes, scores = self._concat(parts[:len(road_terms)], image.shape[:2])
+                obs_masks = self._concat(parts[len(road_terms):], image.shape[:2])[0]
+            else:
+                masks, boxes, scores = self._run_prompt_expression(
+                    inference_state=inference_state,
+                    image_shape=image.shape[:2],
+                    inference_id=inference_id,
+                )
+                obs_masks = None
 
             self._frames_total += 1
             self._frames_with_road += int(masks.shape[0] > 0)
             obstacle_mask = None
             if self.obstacle_prompt.strip():
-                obs_masks, _, _ = self._run_prompt_expression(
-                    inference_state=inference_state,
-                    image_shape=image.shape[:2],
-                    inference_id=inference_id,
-                    expression=self.obstacle_prompt,
-                )
+                if obs_masks is None:
+                    obs_masks, _, _ = self._run_prompt_expression(
+                        inference_state=inference_state,
+                        image_shape=image.shape[:2],
+                        inference_id=inference_id,
+                        expression=self.obstacle_prompt,
+                    )
                 obstacle_mask = (obs_masks.any(dim=0).cpu().numpy() if obs_masks.shape[0] > 0
                                  else numpy.zeros(image.shape[:2], dtype=bool))
                 obstacle_msg = self.cv_bridge.cv2_to_compressed_imgmsg(
